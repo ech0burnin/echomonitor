@@ -5,6 +5,8 @@
 //! feed the flap counter (alerting itself arrives with M4 channels; the
 //! engine logs warn lines so nothing is lost until then).
 
+#![allow(dead_code)]
+// Wired into the daemon in M3.2+ (scheduler + CLI surface); exercised by tests only for now.
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;

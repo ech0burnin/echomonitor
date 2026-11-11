@@ -42,7 +42,10 @@ pub async fn run(dir: &str) -> Result<()> {
         "starting echomonitor"
     );
 
-    let state = Arc::new(transport::NodeState::new(cfg.clone()));
+    let state = Arc::new(transport::NodeState::with_persist(
+        cfg.clone(),
+        dir_path.join("network.toml"),
+    ));
 
     // gossip loop: every interval, push our snapshot to all reachable peers,
     // merge their replies, record RTT latencies

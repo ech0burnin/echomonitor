@@ -2,13 +2,17 @@
 //! Every request carries `X-Em-Token` (current 30s-period HMAC) and `X-Em-Node` (self id).
 //! Middleware rejects anything whose token doesn't verify against the shared network secret.
 //!
-//! M2.2: gossip is a real exchange now — the peer replies with its own snapshot,
+//! M2.2: gossip is a real exchange — the peer replies with its own snapshot,
 //! both sides merge. Latency (RTT) is measured per round and stored on edges.
+//!
+//! M2.4: conflict-resolve by revision + admin hash. Admin content = revision +
+//! nodes + edges (latency-free, order-independent). Forks at the same revision
+//! converge deterministically to the larger admin hash. Merges persist to disk.
 
-// Items wired for M2.3 (routing reads VerifiedNode) are exercised by tests only.
+// Items wired for later milestones (M2.5 elections read VerifiedNode) are exercised by tests only.
 #![allow(dead_code)]
 
-use crate::config::{EdgeEntry, NetworkConfig, NodeEntry};
+use crate::config::{admin_hash, EdgeEntry, NetworkConfig, NodeEntry};
 use crate::crypto;
 use axum::{
     extract::{Request, State},
@@ -28,14 +32,41 @@ use std::time::Instant;
 
 pub struct NodeState {
     /// Working view of the network config; mutated by gossip merges and
-    /// latency measurements. Stricter conflict rules arrive in M2.4.
+    /// latency measurements.
     pub cfg: Arc<RwLock<NetworkConfig>>,
+    /// Where merged configs are persisted (network.toml); None in tests.
+    pub persist_path: Option<std::path::PathBuf>,
 }
 
 impl NodeState {
     pub fn new(cfg: NetworkConfig) -> Self {
         Self {
             cfg: Arc::new(RwLock::new(cfg)),
+            persist_path: None,
+        }
+    }
+
+    pub fn with_persist(cfg: NetworkConfig, path: std::path::PathBuf) -> Self {
+        Self {
+            cfg: Arc::new(RwLock::new(cfg)),
+            persist_path: Some(path),
+        }
+    }
+
+    /// Atomically persist the current config view (tmp file + rename).
+    /// Best-effort: persistence failure is logged, never fatal.
+    pub fn persist(&self) {
+        if let Some(path) = &self.persist_path {
+            let snapshot = self.cfg.read().unwrap().clone();
+            let tmp = path.with_extension("toml.tmp");
+            match snapshot.save(&tmp) {
+                Ok(()) => {
+                    if let Err(e) = std::fs::rename(&tmp, path) {
+                        tracing::warn!(error = %e, "config persist rename failed");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "config persist save failed"),
+            }
         }
     }
 
@@ -88,42 +119,106 @@ fn ensure_self_present(g: &mut NetworkConfig) {
     }
 }
 
-/// Merge a received gossip message into the local config view.
-/// - newer revision: adopt wholesale (sender is ahead)
-/// - same revision: union nodes, fill in latencies we lack
-/// - older revision: ignore content (we are ahead); sender still learns from our reply
-pub fn merge_into(cfg: &RwLock<NetworkConfig>, msg: &GossipMessage) {
-    let mut g = cfg.write().unwrap();
-    if msg.revision > g.revision {
-        g.nodes = msg.nodes.clone();
-        g.edges = msg.edges.iter().map(normalized).collect();
-        g.revision = msg.revision;
-        ensure_self_present(&mut g);
-        g.recompute_hash();
-    } else if msg.revision == g.revision {
-        for n in &msg.nodes {
-            if !g.nodes.iter().any(|x| x.id == n.id) {
-                g.nodes.push(n.clone());
+/// Adopt the sender's admin content wholesale, preserving locally measured
+/// latencies for edges that survive the adoption.
+fn adopt(g: &mut NetworkConfig, msg: &GossipMessage) {
+    let local_latencies: std::collections::HashMap<(u32, u32), u64> = g
+        .edges
+        .iter()
+        .filter_map(|e| {
+            e.latency_ms
+                .map(|ms| ((e.a.min(e.b), e.a.max(e.b)), ms))
+        })
+        .collect();
+    g.nodes = msg.nodes.clone();
+    g.edges = msg
+        .edges
+        .iter()
+        .map(|e| {
+            let mut e = normalized(e);
+            if e.latency_ms.is_none() {
+                e.latency_ms = local_latencies.get(&(e.a, e.b)).copied();
             }
-        }
-        for e in &msg.edges {
-            let e = normalized(e);
-            match g.edges.iter_mut().find(|x| same_edge(x, &e)) {
-                Some(local) => {
-                    if local.latency_ms.is_none() {
-                        local.latency_ms = e.latency_ms;
-                    }
-                }
-                None => g.edges.push(e),
-            }
-        }
-        ensure_self_present(&mut g);
-        g.recompute_hash();
+            e
+        })
+        .collect();
+    g.revision = msg.revision;
+    ensure_self_present(g);
+    g.recompute_hash();
+}
+
+/// Deterministic field merge for conflicting entries of the same node id:
+/// missing values fill in, conflicting values resolve to the lexicographic max.
+/// Fully commutative: merge(a, b) == merge(b, a), so both sides of an exchange
+/// compute the identical result and converge in a single round.
+fn pick_opt(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
     }
 }
 
+fn merge_node_entry(local: &NodeEntry, remote: &NodeEntry) -> NodeEntry {
+    NodeEntry {
+        id: local.id,
+        name: local.name.clone().max(remote.name.clone()),
+        public_key: pick_opt(local.public_key.clone(), remote.public_key.clone()),
+        address: pick_opt(local.address.clone(), remote.address.clone()),
+    }
+}
+
+/// Union merge at equal revisions (covers both "same content, exchange
+/// latencies" and "forked content, reconcile"). Commutative: nodes union by
+/// id with deterministic entry merge, edges union by normalized pair, edge
+/// latency keeps the local measurement and fills from the peer if missing.
+fn union_merge(g: &mut NetworkConfig, msg: &GossipMessage) {
+    for n in &msg.nodes {
+        match g.nodes.iter_mut().find(|x| x.id == n.id) {
+            Some(existing) => *existing = merge_node_entry(existing, n),
+            None => g.nodes.push(n.clone()),
+        }
+    }
+    for e in &msg.edges {
+        let e = normalized(e);
+        match g.edges.iter_mut().find(|x| same_edge(x, &e)) {
+            Some(local) => {
+                if local.latency_ms.is_none() {
+                    local.latency_ms = e.latency_ms;
+                }
+            }
+            None => g.edges.push(e),
+        }
+    }
+    g.recompute_hash();
+}
+
+/// Merge a received gossip message into the local config view.
+/// - newer revision: adopt wholesale (preserve local latencies)
+/// - same revision: commutative union merge — identical result on both sides,
+///   so forks converge deterministically in a single exchange round
+/// - older revision: ignore (we are ahead); sender learns from our reply
+pub fn merge_into(cfg: &RwLock<NetworkConfig>, msg: &GossipMessage) {
+    let mut g = cfg.write().unwrap();
+    if msg.revision > g.revision {
+        adopt(&mut g, msg);
+    } else if msg.revision == g.revision {
+        let local_admin = admin_hash(g.revision, &g.nodes, &g.edges);
+        let msg_admin = admin_hash(msg.revision, &msg.nodes, &msg.edges);
+        if local_admin != msg_admin {
+            tracing::warn!(
+                local = %local_admin,
+                remote = %msg_admin,
+                "config fork at same revision: union-merging"
+            );
+        }
+        union_merge(&mut g, msg);
+    }
+    // older revision: ignore
+}
+
 /// Record measured RTT to a peer. Latency churn does not bump the revision:
-/// revision tracks admin-level topology changes (M2.4 refines this).
+/// revision tracks admin-level topology changes only.
 pub fn set_edge_latency(cfg: &RwLock<NetworkConfig>, x: u32, y: u32, ms: u64) {
     let (lo, hi) = (x.min(y), x.max(y));
     let mut g = cfg.write().unwrap();
@@ -139,7 +234,7 @@ pub fn set_edge_latency(cfg: &RwLock<NetworkConfig>, x: u32, y: u32, ms: u64) {
 }
 
 /// One gossip pass: push our snapshot to every reachable peer, merge replies,
-/// measure RTT. Returns (peer_id, Some(latency_ms)) per peer, None on failure.
+/// measure RTT, persist. Returns (peer_id, Some(latency_ms)) per peer, None on failure.
 pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, Option<u64>)> {
     let (self_id, targets) = {
         let g = state.cfg.read().unwrap();
@@ -170,6 +265,7 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
             }
         }
     }
+    state.persist();
     out
 }
 
@@ -210,13 +306,14 @@ async fn health(State(state): State<Arc<NodeState>>) -> Json<serde_json::Value> 
     }))
 }
 
-/// Inbound topology gossip: merge the peer's view, reply with our own snapshot
-/// (push-pull in a single round trip).
+/// Inbound topology gossip: merge the peer's view, persist, reply with our
+/// own snapshot (push-pull in a single round trip).
 async fn gossip(
     State(state): State<Arc<NodeState>>,
     Json(msg): Json<GossipMessage>,
 ) -> Json<GossipMessage> {
     merge_into(&state.cfg, &msg);
+    state.persist();
     Json(state.snapshot_msg())
 }
 
@@ -363,19 +460,120 @@ mod tests {
     }
 
     #[test]
-    fn merge_equal_revision_fills_missing_latency() {
-        let local = NetworkConfig::bootstrap("s".into(), "n1".into());
+    fn adopt_preserves_local_latencies() {
+        let mut local = NetworkConfig::bootstrap("s".into(), "n1".into());
+        local.edges.push(EdgeEntry { a: 1, b: 2, latency_ms: Some(42) });
+        local.recompute_hash();
+        let shared = RwLock::new(local);
+        // newer revision from a peer whose edge has NO latency yet
+        let msg = GossipMessage {
+            from: 2,
+            revision: 7,
+            nodes: vec![
+                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None },
+                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
+            ],
+            edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
+        };
+        merge_into(&shared, &msg);
+        let g = shared.read().unwrap();
+        assert_eq!(g.revision, 7);
+        assert!(
+            g.edges.iter().any(|e| e.a == 1 && e.b == 2 && e.latency_ms == Some(42)),
+            "locally measured latency must survive adoption"
+        );
+    }
+
+    #[test]
+    fn same_admin_content_exchanges_latencies() {
+        // identical admin content on both sides, only the peer knows the latency
+        let mut local = NetworkConfig::bootstrap("s".into(), "n1".into());
+        local.nodes.push(NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None });
+        local.edges.push(EdgeEntry { a: 1, b: 2, latency_ms: None });
+        local.recompute_hash();
         let shared = RwLock::new(local);
         let msg = GossipMessage {
             from: 2,
-            revision: 1,
-            nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None }],
+            revision: shared.read().unwrap().revision,
+            nodes: vec![
+                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None },
+                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
+            ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
-        assert!(g.nodes.iter().any(|n| n.id == 2));
-        assert!(g.edges.iter().any(|e| e.a == 1 && e.b == 2 && e.latency_ms == Some(12)));
+        assert!(
+            g.edges.iter().any(|e| e.a == 1 && e.b == 2 && e.latency_ms == Some(12)),
+            "latency from the peer must fill our missing value"
+        );
+    }
+
+    #[test]
+    fn same_revision_fork_converges_deterministically() {
+        // two nodes bootstrapped independently: same revision, different node sets
+        let mut a = NetworkConfig::bootstrap("s".into(), "n1".into());
+        a.revision = 5;
+        let mut b = NetworkConfig::bootstrap("s".into(), "n2".into());
+        b.self_id = 2;
+        b.nodes[0].id = 2;
+        b.revision = 5;
+        a.recompute_hash();
+        b.recompute_hash();
+
+        let shared_a = RwLock::new(a);
+        let shared_b = RwLock::new(b);
+
+        // each receives the other's snapshot (like a real gossip exchange)
+        let msg_b_to_a = shared_b.read().unwrap().clone();
+        let msg_a_to_b = shared_a.read().unwrap().clone();
+        merge_into(
+            &shared_a,
+            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone() },
+        );
+        merge_into(
+            &shared_b,
+            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone() },
+        );
+
+        let ga = shared_a.read().unwrap();
+        let gb = shared_b.read().unwrap();
+        let ha = admin_hash(ga.revision, &ga.nodes, &ga.edges);
+        let hb = admin_hash(gb.revision, &gb.nodes, &gb.edges);
+        assert_eq!(
+            ha, hb,
+            "both sides must converge to the same admin content after a fork"
+        );
+        // both know both nodes (loser adopts winner content, ensure_self re-adds self)
+        assert!(ga.nodes.iter().any(|n| n.id == 1) && ga.nodes.iter().any(|n| n.id == 2));
+        assert!(gb.nodes.iter().any(|n| n.id == 1) && gb.nodes.iter().any(|n| n.id == 2));
+    }
+
+    #[test]
+    fn persist_writes_merged_config_to_disk() {
+        let dir = std::env::temp_dir().join("em-persist-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let state = NodeState::with_persist(
+            NetworkConfig::bootstrap("s".into(), "n1".into()),
+            path.clone(),
+        );
+        merge_into(
+            &state.cfg,
+            &GossipMessage {
+                from: 2,
+                revision: 3,
+                nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None }],
+                edges: vec![],
+            },
+        );
+        state.persist();
+
+        let loaded = NetworkConfig::load(&path).unwrap();
+        assert_eq!(loaded.revision, 3);
+        assert!(loaded.nodes.iter().any(|n| n.id == 2));
     }
 
     // ---------- HTTP integration tests ----------

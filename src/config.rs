@@ -1,6 +1,10 @@
 //! Network-wide configuration, replicated to every node.
 //! TOML with strict deserialization: unknown fields are an error,
 //! so a stale binary never silently ignores fields written by a newer one.
+//!
+//! M2.4: `content_hash` covers admin-level content only (revision + nodes +
+//! edges WITHOUT latencies). Latencies are runtime measurements: they must not
+//! trigger admin conflicts or bump revisions when they churn.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -13,9 +17,9 @@ pub const DEFAULT_GOSSIP_INTERVAL_SECS: u64 = 15;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Monotonic config revision, bumped on every change.
+    /// Monotonic config revision, bumped on every admin change.
     pub revision: u64,
-    /// Hash of the canonical content; nodes refuse configs whose hash mismatches.
+    /// Canonical admin hash; nodes refuse configs whose hash mismatches.
     #[serde(rename = "content-hash")]
     pub content_hash: String,
     /// This node's numeric id within the mesh.
@@ -72,8 +76,36 @@ pub struct NodeEntry {
 pub struct EdgeEntry {
     pub a: u32,
     pub b: u32,
+    /// Measured RTT; runtime data, excluded from the admin hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+}
+
+/// Canonical admin-level hash over (revision, nodes, edges-without-latency).
+/// Order-independent: nodes sorted by id, edges sorted and normalized,
+/// so two configs describing the same network hash identically.
+pub fn admin_hash(revision: u64, nodes: &[NodeEntry], edges: &[EdgeEntry]) -> String {
+    let mut nodes_canon: Vec<(u32, &str, Option<&str>, Option<&str>)> = nodes
+        .iter()
+        .map(|n| {
+            (
+                n.id,
+                n.name.as_str(),
+                n.public_key.as_deref(),
+                n.address.as_deref(),
+            )
+        })
+        .collect();
+    nodes_canon.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(y.1)));
+    let mut edges_canon: Vec<(u32, u32)> = edges
+        .iter()
+        .map(|e| (e.a.min(e.b), e.a.max(e.b)))
+        .collect();
+    edges_canon.sort();
+    let canonical =
+        serde_json::to_string(&(revision, nodes_canon, edges_canon)).unwrap_or_default();
+    let digest = Sha256::digest(canonical.as_bytes());
+    hex::encode(&digest[..12])
 }
 
 impl NetworkConfig {
@@ -101,12 +133,9 @@ impl NetworkConfig {
         cfg
     }
 
-    /// Canonical content hash over revision + nodes + edges.
+    /// Recompute the canonical admin hash from current content.
     pub fn recompute_hash(&mut self) {
-        let canonical = serde_json::to_string(&(self.revision, &self.nodes, &self.edges))
-            .unwrap_or_default();
-        let digest = Sha256::digest(canonical.as_bytes());
-        self.content_hash = hex::encode(&digest[..12]);
+        self.content_hash = admin_hash(self.revision, &self.nodes, &self.edges);
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -164,5 +193,33 @@ bogus_field = 1
         a.revision += 1;
         a.recompute_hash();
         assert_ne!(h1, a.content_hash);
+    }
+
+    #[test]
+    fn latency_is_not_part_of_admin_hash() {
+        let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
+        let mut b = a.clone();
+        a.edges.push(EdgeEntry { a: 1, b: 2, latency_ms: None });
+        b.edges.push(EdgeEntry { a: 2, b: 1, latency_ms: Some(999) });
+        a.recompute_hash();
+        b.recompute_hash();
+        assert_eq!(
+            a.content_hash, b.content_hash,
+            "latency and edge direction must not affect the admin hash"
+        );
+    }
+
+    #[test]
+    fn hash_is_order_independent() {
+        let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
+        let mut b = a.clone();
+        a.nodes.push(NodeEntry { id: 2, name: "x".into(), public_key: None, address: None });
+        a.nodes.push(NodeEntry { id: 3, name: "y".into(), public_key: None, address: None });
+        // same nodes, pushed in reverse order
+        b.nodes.push(NodeEntry { id: 3, name: "y".into(), public_key: None, address: None });
+        b.nodes.push(NodeEntry { id: 2, name: "x".into(), public_key: None, address: None });
+        a.recompute_hash();
+        b.recompute_hash();
+        assert_eq!(a.content_hash, b.content_hash);
     }
 }
