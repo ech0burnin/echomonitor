@@ -4,13 +4,15 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Token validity period, seconds.
 pub const TOKEN_PERIOD_SECS: u64 = 30;
 /// How many periods back/forward a token is accepted (clock skew allowance).
+/// Used by the auth middleware arriving in M2.1.
+#[allow(dead_code)]
 pub const TOKEN_WINDOW: i64 = 1;
 
 pub struct KeyPair {
@@ -58,6 +60,8 @@ pub fn token_now(secret: &str) -> String {
 }
 
 /// Accept tokens from the current and neighbouring periods (±TOKEN_WINDOW).
+/// Used by the auth middleware arriving in M2.1.
+#[allow(dead_code)]
 pub fn verify_token(secret: &str, token: &str) -> bool {
     let idx = (unix_now() / TOKEN_PERIOD_SECS) as i64;
     for delta in -TOKEN_WINDOW..=TOKEN_WINDOW {
@@ -66,13 +70,6 @@ pub fn verify_token(secret: &str, token: &str) -> bool {
         }
     }
     false
-}
-
-/// Short digest used for content hashes elsewhere.
-pub fn sha256_hex_prefix(data: &[u8], len: usize) -> String {
-    let digest = Sha256::digest(data);
-    let len = len.min(digest.len());
-    hex::encode(&digest[..len])
 }
 
 #[cfg(test)]
