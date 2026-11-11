@@ -1,0 +1,20 @@
+[package]
+name = "echomonitor"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted distributed mesh monitoring: one static binary, zero target-host dependencies"
+license = "MIT"
+repository = "https://github.com/ech0burnin/echomonitor"
+readme = "README.md"
+keywords = ["monitoring", "mesh", "self-hosted", "network"]
+categories = ["command-line-utilities", "network-management"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

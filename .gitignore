@@ -1,0 +1,21 @@
+target/
+debug/
+release/
+# echo's working files (agent instructions, not part of the product)
+.echo-working/
+echoops/
+*.log
+logs/
+.env
+.env.*
+*.local
+# OS junk
+.DS_Store
+Thumbs.db
+# IDE
+.idea/
+.vscode/
+# test artifacts
+*.sqlite
+*.db
+test-output/
