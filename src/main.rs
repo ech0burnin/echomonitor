@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 
-mod api;
 mod cli;
 mod config;
 mod crypto;
@@ -42,8 +41,12 @@ enum Commands {
         #[arg(long, default_value = "root")]
         user: String,
     },
-    /// Show network status summary (planned for M2)
-    Status,
+    /// Show network status: nodes, edges, latencies
+    Status {
+        /// Directory containing network.toml
+        #[arg(default_value = ".")]
+        dir: String,
+    },
 }
 
 #[tokio::main]
@@ -57,9 +60,6 @@ async fn main() -> anyhow::Result<()> {
             println!("deploy: not implemented yet (planned for M5)");
             Ok(())
         }
-        Commands::Status => {
-            println!("status: not implemented yet (planned for M2)");
-            Ok(())
-        }
+        Commands::Status { dir } => cli::status(&dir).await,
     }
 }

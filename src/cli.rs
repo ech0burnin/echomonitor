@@ -1,16 +1,16 @@
-//! Subcommand implementations (init / run / keygen).
+//! Subcommand implementations (init / run / keygen / status).
 
 use crate::config::NetworkConfig;
 use crate::crypto;
-use crate::transport;
+use crate::transport::{self, GossipMessage, NodeClient};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub fn init(dir: &str) -> Result<()> {
     let dir_path = Path::new(dir);
-    std::fs::create_dir_all(dir_path)
-        .with_context(|| format!("cannot create {dir}"))?;
+    std::fs::create_dir_all(dir_path).with_context(|| format!("cannot create {dir}"))?;
 
     let keys = crypto::KeyPair::generate();
     std::fs::write(dir_path.join("node.key"), &keys.secret_hex)?;
@@ -41,12 +41,24 @@ pub async fn run(dir: &str) -> Result<()> {
         "starting echomonitor"
     );
 
-    let state = Arc::new(transport::NodeState {
-        network_secret: cfg.auth.network_secret.as_str().into(),
-        self_id: cfg.self_id,
-        self_name: cfg.self_name.as_str().into(),
-        revision: cfg.revision,
-        content_hash: cfg.content_hash.as_str().into(),
+    let state = Arc::new(transport::NodeState::new(cfg.clone()));
+
+    // gossip loop: every interval, push our snapshot to all reachable peers,
+    // merge their replies, record RTT latencies
+    let secret: Arc<str> = cfg.auth.network_secret.as_str().into();
+    let self_id = cfg.self_id;
+    let interval = cfg.net.gossip_interval_secs.max(1);
+    let loop_state = state.clone();
+    tokio::spawn(async move {
+        let client = NodeClient::new(secret, self_id);
+        let mut tick = tokio::time::interval(Duration::from_secs(interval));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let results = transport::gossip_round(&loop_state, &client).await;
+            let ok = results.iter().filter(|(_, l)| l.is_some()).count();
+            tracing::debug!(peers = results.len(), ok, "gossip round done");
+        }
     });
 
     transport::serve(state, cfg.net.listen_port).await
@@ -56,5 +68,53 @@ pub fn keygen() -> Result<()> {
     let kp = crypto::KeyPair::generate();
     println!("secret: {}", kp.secret_hex);
     println!("public: {}", kp.public_hex);
+    Ok(())
+}
+
+pub async fn status(dir: &str) -> Result<()> {
+    let dir_path = Path::new(dir);
+    let cfg = NetworkConfig::load(&dir_path.join("network.toml"))
+        .with_context(|| format!("network.toml not found in {dir}"))?;
+
+    let client = NodeClient::new(cfg.auth.network_secret.as_str().into(), cfg.self_id);
+    let addr = format!("127.0.0.1:{}", cfg.net.listen_port);
+
+    let (msg, live) = match client.state(&addr).await {
+        Ok(m) => (m, true),
+        Err(_) => (
+            GossipMessage {
+                from: cfg.self_id,
+                revision: cfg.revision,
+                nodes: cfg.nodes.clone(),
+                edges: cfg.edges.clone(),
+            },
+            false,
+        ),
+    };
+
+    println!("node: {} (id {})", cfg.self_name, cfg.self_id);
+    println!("revision {}  hash {}", msg.revision, cfg.content_hash);
+    if live {
+        println!("source: live daemon at {addr}");
+    } else {
+        println!("source: local network.toml (daemon not reachable at {addr})");
+    }
+    println!();
+    println!("nodes:");
+    for n in &msg.nodes {
+        let naddr = n.address.as_deref().unwrap_or("-");
+        println!("  {}  {}  {}", n.id, n.name, naddr);
+    }
+    if msg.edges.is_empty() {
+        println!("edges: (none yet)");
+    } else {
+        println!("edges:");
+        for e in &msg.edges {
+            match e.latency_ms {
+                Some(ms) => println!("  {} - {}  {} ms", e.a, e.b, ms),
+                None => println!("  {} - {}  ?", e.a, e.b),
+            }
+        }
+    }
     Ok(())
 }
