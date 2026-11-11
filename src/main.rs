@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod checks;
 mod cli;
 mod config;
 mod crypto;
