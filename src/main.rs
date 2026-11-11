@@ -1,11 +1,17 @@
 use clap::{Parser, Subcommand};
 
+mod api;
+mod cli;
+mod config;
+mod crypto;
+mod logging;
+
 #[derive(Parser)]
 #[command(
     name = "echomonitor",
     version,
     about = "Self-hosted distributed mesh monitoring",
-    long_about = "echomonitor — mesh-network monitoring system.\nOne binary acts as either the parent node (web UI + coordinator)\nor a child node. Run `echomonitor init` on the first host to bootstrap a network."
+    long_about = "echomonitor — mesh-network monitoring system.\nOne binary acts as either the parent node (web UI + coordinator)\nor a child node. Run `echomonitor init <dir>` on the first host to bootstrap a network."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -14,77 +20,45 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Bootstrap the parent node: keys, network config, admin user
-    Init,
-    /// Run the daemon (parent or child role is decided by the network)
-    Run,
-    /// Deploy a child node to a remote host via SSH
+    /// Bootstrap a node: keys, network config
+    Init {
+        /// Target directory (created if missing)
+        dir: String,
+    },
+    /// Run the daemon (role is decided by the network config)
+    Run {
+        /// Directory containing network.toml
+        dir: String,
+    },
+    /// Generate an ed25519 keypair and print it
+    Keygen,
+    /// Deploy a child node to a remote host via SSH (planned for M5)
     Deploy {
         /// Target host (IP or hostname)
         host: String,
-        /// SSH port on the target host
         #[arg(long, default_value_t = 22)]
         port: u16,
-        /// SSH user on the target host
         #[arg(long, default_value = "root")]
         user: String,
     },
-    /// Show network status summary
+    /// Show network status summary (planned for M2)
     Status,
-    /// List known mesh nodes
-    Nodes,
-    /// List configured alert channels
-    Channels,
-    /// Self-check: config, ports, channels
-    Doctor,
-    /// Show recent log lines
-    Logs {
-        /// Follow the log stream
-        #[arg(short, long)]
-        follow: bool,
-    },
-    /// Generate a network keypair (used by init and deploy)
-    Keygen,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init => {
-            println!("not implemented yet (milestone 1)");
-            std::process::exit(2);
-        }
-        Commands::Run => {
-            println!("not implemented yet (milestone 1)");
-            std::process::exit(2);
-        }
+        Commands::Init { dir } => cli::init(&dir),
+        Commands::Run { dir } => cli::run(&dir).await,
+        Commands::Keygen => cli::keygen(),
         Commands::Deploy { .. } => {
-            println!("not implemented yet (milestone 5)");
-            std::process::exit(2);
+            println!("deploy: not implemented yet (planned for M5)");
+            Ok(())
         }
         Commands::Status => {
-            println!("not implemented yet (milestone 2)");
-            std::process::exit(2);
-        }
-        Commands::Nodes => {
-            println!("not implemented yet (milestone 2)");
-            std::process::exit(2);
-        }
-        Commands::Channels => {
-            println!("not implemented yet (milestone 4)");
-            std::process::exit(2);
-        }
-        Commands::Doctor => {
-            println!("not implemented yet (milestone 8)");
-            std::process::exit(2);
-        }
-        Commands::Logs { .. } => {
-            println!("not implemented yet (milestone 1)");
-            std::process::exit(2);
-        }
-        Commands::Keygen => {
-            println!("not implemented yet (milestone 1)");
-            std::process::exit(2);
+            println!("status: not implemented yet (planned for M2)");
+            Ok(())
         }
     }
 }
