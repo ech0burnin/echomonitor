@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod crypto;
 mod logging;
+mod routing;
 mod transport;
 
 #[derive(Parser)]
