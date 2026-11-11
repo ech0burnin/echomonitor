@@ -55,6 +55,8 @@ pub fn token_at(secret: &str, period_index: u64) -> String {
 }
 
 /// Token valid right now.
+// Called from transport::NodeClient (dead until M2.3 wires the gossip loop into main).
+#[allow(dead_code)]
 pub fn token_now(secret: &str) -> String {
     token_at(secret, unix_now() / TOKEN_PERIOD_SECS)
 }

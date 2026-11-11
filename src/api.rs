@@ -1,5 +1,7 @@
 //! HTTP API (axum). M1.1: health endpoint only;
 //! auth middleware and mesh endpoints arrive with M1.2/M2.
+//! `serve` is wired into `main` when the `run` command grows a server (M2.3).
+#![allow(dead_code)]
 
 use axum::{routing::get, Json, Router};
 use serde_json::json;

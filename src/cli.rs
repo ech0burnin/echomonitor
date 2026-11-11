@@ -2,8 +2,10 @@
 
 use crate::config::NetworkConfig;
 use crate::crypto;
+use crate::transport;
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::Arc;
 
 pub fn init(dir: &str) -> Result<()> {
     let dir_path = Path::new(dir);
@@ -39,11 +41,15 @@ pub async fn run(dir: &str) -> Result<()> {
         "starting echomonitor"
     );
 
-    let secret = cfg.auth.network_secret.clone();
-    let token = crypto::token_now(&secret);
-    tracing::debug!(token = %token, "current auth token (debug only)");
+    let state = Arc::new(transport::NodeState {
+        network_secret: cfg.auth.network_secret.as_str().into(),
+        self_id: cfg.self_id,
+        self_name: cfg.self_name.as_str().into(),
+        revision: cfg.revision,
+        content_hash: cfg.content_hash.as_str().into(),
+    });
 
-    crate::api::serve(cfg.net.listen_port).await
+    transport::serve(state, cfg.net.listen_port).await
 }
 
 pub fn keygen() -> Result<()> {

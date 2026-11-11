@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod crypto;
 mod logging;
+mod transport;
 
 #[derive(Parser)]
 #[command(
