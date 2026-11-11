@@ -3,6 +3,7 @@
 use crate::config::NetworkConfig;
 use crate::crypto;
 use crate::transport::{self, GossipMessage, NodeClient};
+use crate::routing;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
@@ -114,6 +115,21 @@ pub async fn status(dir: &str) -> Result<()> {
                 Some(ms) => println!("  {} - {}  {} ms", e.a, e.b, ms),
                 None => println!("  {} - {}  ?", e.a, e.b),
             }
+        }
+    }
+    println!();
+    let table = routing::RoutingTable::build(cfg.self_id, &msg.nodes, &msg.edges);
+    let routes: Vec<&u32> = table.all().keys().collect();
+    if routes.is_empty() {
+        println!("routes: (no peers reachable yet)");
+    } else {
+        println!("routes:");
+        let mut targets: Vec<_> = table.all().keys().copied().collect();
+        targets.sort();
+        for t in targets {
+            let r = table.route(t).unwrap();
+            let path: Vec<String> = r.path.iter().map(|x| x.to_string()).collect();
+            println!("  → {}  via {}  {} ms  [{}]", t, r.next_hop, r.cost_ms, path.join("→"));
         }
     }
     Ok(())

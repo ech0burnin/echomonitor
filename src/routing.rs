@@ -104,6 +104,8 @@ pub fn build(self_id: u32, nodes: &[NodeEntry], edges: &[EdgeEntry]) -> Self {
         RoutingTable { routes }
     }
 
+    /// Next hop toward target. Will be used by the ping layer (M3).
+    #[allow(dead_code)]
     pub fn next_hop(&self, target: u32) -> Option<u32> {
         self.routes.get(&target).map(|r| r.next_hop)
     }
