@@ -32,6 +32,9 @@ pub struct NetworkConfig {
     pub nodes: Vec<NodeEntry>,
     #[serde(default)]
     pub edges: Vec<EdgeEntry>,
+    /// Scheduled HTTP checks ([[checks]] table). Optional, default none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<crate::checks::HttpCheckSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +131,7 @@ impl NetworkConfig {
                 address: None,
             }],
             edges: Vec::new(),
+            checks: Vec::new(),
         };
         cfg.recompute_hash();
         cfg

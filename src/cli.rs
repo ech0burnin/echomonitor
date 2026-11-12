@@ -65,6 +65,21 @@ pub async fn run(dir: &str) -> Result<()> {
         }
     });
 
+    // M3.1 wiring: scheduled HTTP checks from [[checks]] config.
+    // Empty list = no check tasks spawned, engine off.
+    if !cfg.checks.is_empty() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let engine = std::sync::Arc::new(crate::checks::Engine::new(10, 3));
+        let specs = cfg.checks.clone();
+        tracing::info!(count = specs.len(), "check engine starting");
+        tokio::spawn(async move {
+            engine.run(specs, shutdown_rx).await;
+        });
+        // keep the sender alive for the daemon's lifetime; dropping it would
+        // make `changed()` return immediately and shut the engine down.
+        std::mem::forget(shutdown_tx);
+    }
+
     transport::serve(state, cfg.net.listen_port).await
 }
 
