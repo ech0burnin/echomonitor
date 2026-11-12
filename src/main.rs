@@ -6,6 +6,7 @@ mod config;
 mod crypto;
 mod logging;
 mod routing;
+mod selfstats;
 mod transport;
 
 #[derive(Parser)]

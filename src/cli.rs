@@ -136,6 +136,24 @@ pub async fn status(dir: &str) -> Result<()> {
         }
     }
     println!();
+    // M3.4: self observation (local /proc + statvfs, not part of gossip)
+    match crate::selfstats::SelfStats::collect() {
+        Ok(s) => {
+            println!("self: (collected_at unix {})", s.collected_at);
+            println!("  ram   used {:>5.1}%  ({:.1} GiB available / {:.1} GiB total)",
+                s.mem.used_pct,
+                s.mem.available_kb as f64 / 1024.0 / 1024.0,
+                s.mem.total_kb as f64 / 1024.0 / 1024.0);
+            println!("  load  {:.2} {:.2} {:.2}  (procs {}/{})",
+                s.load.one, s.load.five, s.load.fifteen, s.load.running, s.load.total_procs);
+            println!("  disk  used {:>5.1}%  ({:.1} GiB free / {:.1} GiB total)",
+                s.disk.used_pct,
+                s.disk.free_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                s.disk.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+        }
+        Err(e) => println!("self: (unavailable: {e})"),
+    }
+    println!();
     let table = routing::RoutingTable::build(cfg.self_id, &msg.nodes, &msg.edges);
     let routes: Vec<&u32> = table.all().keys().collect();
     if routes.is_empty() {
