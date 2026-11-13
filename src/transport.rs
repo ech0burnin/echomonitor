@@ -56,6 +56,10 @@ pub struct NodeState {
     /// the daemon's unit monitor loop). Runtime-only state: never
     /// persisted, never part of admin_hash, ignored by peers on merge.
     pub units: Arc<RwLock<Vec<crate::selfstats::UnitStatus>>>,
+    /// M3.2: directed SSH-availability matrix, latest per (from, to).
+    /// Runtime-only state: never persisted, never part of admin_hash;
+    /// merged LWW on `measured_at` (see sshmatrix::merge_ssh_probes).
+    pub ssh_matrix: Arc<RwLock<crate::sshmatrix::SshMatrix>>,
     /// M2.6: SSH fallback tunnel manager (tokio Mutex — building a tunnel
     /// is async). None when `node.key` is absent/unusable (tests, plain
     /// status runs): no node gets a tunnel, behavior is M2.5-identical.
@@ -72,6 +76,7 @@ impl NodeState {
             evidence: Arc::new(RwLock::new(evidence)),
             parent: RwLock::new(None),
             units: Arc::new(RwLock::new(Vec::new())),
+            ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
             tunnels: tokio::sync::Mutex::new(None),
         }
     }
@@ -85,6 +90,7 @@ impl NodeState {
             evidence: Arc::new(RwLock::new(evidence)),
             parent: RwLock::new(None),
             units: Arc::new(RwLock::new(Vec::new())),
+            ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
             tunnels: tokio::sync::Mutex::new(None),
         }
     }
@@ -111,6 +117,13 @@ impl NodeState {
         *self.units.write().unwrap() = units;
     }
 
+    /// M3.2: record one of OUR OWN ssh-matrix probe results (writer: the
+    /// daemon's ssh matrix loop; the table then rides along with gossip).
+    pub fn record_own_ssh_probe(&self, probe: crate::sshmatrix::SshProbe) {
+        let mut t = self.ssh_matrix.write().unwrap();
+        t.insert((probe.from, probe.to), probe);
+    }
+
     /// Atomically persist the current config view (tmp file + rename).
     /// Best-effort: persistence failure is logged, never fatal.
     pub fn persist(&self) {
@@ -129,11 +142,14 @@ impl NodeState {
     }
 
     /// Point-in-time copy of our topology for gossip/state replies.
-    /// Includes the full probe table (ours + everything learned from peers),
-    /// so results propagate transitively through the mesh.
+    /// Includes the full probe table and ssh matrix (ours + everything
+    /// learned from peers), so results propagate transitively through
+    /// the mesh.
     pub fn snapshot_msg(&self) -> GossipMessage {
         let g = self.cfg.read().unwrap();
         let probes: Vec<SiteProbe> = self.probes.read().unwrap().values().cloned().collect();
+        let ssh: Vec<crate::sshmatrix::SshProbe> =
+            self.ssh_matrix.read().unwrap().values().cloned().collect();
         let seen: Vec<SeenEntry> = self
             .evidence
             .read()
@@ -147,6 +163,7 @@ impl NodeState {
             nodes: g.nodes.clone(),
             edges: g.edges.clone(),
             probes,
+            ssh,
             seen,
             units: self.units.read().unwrap().clone(),
         }
@@ -165,6 +182,10 @@ pub struct GossipMessage {
     /// from older binaries (no probes field) deserializable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<SiteProbe>,
+    /// M3.2: directed ssh-availability matrix rows shared through gossip,
+    /// latest per (from, to). Same old-wire safety as probes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh: Vec<crate::sshmatrix::SshProbe>,
     /// M2.5 liveness evidence shared through gossip. Same old-wire safety.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seen: Vec<SeenEntry>,
@@ -474,6 +495,7 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
             Some((reply, ms)) => {
                 merge_into(&state.cfg, &reply);
                 merge_probes(&state.probes, &reply.probes);
+                crate::sshmatrix::merge_ssh_probes(&state.ssh_matrix, &reply.ssh);
                 merge_seen(&state.evidence, &reply.seen);
                 state.record_seen(peer_id, crate::checks::chrono_pseudo::Ts::now().unix_ms());
                 set_edge_latency(&state.cfg, self_id, peer_id, ms);
@@ -622,6 +644,7 @@ async fn gossip(
 ) -> Json<GossipMessage> {
     merge_into(&state.cfg, &msg);
     merge_probes(&state.probes, &msg.probes);
+    crate::sshmatrix::merge_ssh_probes(&state.ssh_matrix, &msg.ssh);
     merge_seen(&state.evidence, &msg.seen);
     state.record_seen(msg.from, crate::checks::chrono_pseudo::Ts::now().unix_ms());
     state.persist();
@@ -818,7 +841,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()), ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(7) }],
-            probes: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -839,7 +862,7 @@ mod tests {
             revision: 2,
             nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None, ssh: None }],
             edges: vec![],
-            probes: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -862,7 +885,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
-            probes: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -889,7 +912,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
-            probes: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -919,11 +942,11 @@ mod tests {
         let msg_a_to_b = shared_a.read().unwrap().clone();
         merge_into(
             &shared_a,
-            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], seen: vec![], units: vec![] },
+            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![] },
         );
         merge_into(
             &shared_b,
-            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], seen: vec![], units: vec![] },
+            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![] },
         );
 
         let ga = shared_a.read().unwrap();
@@ -957,7 +980,7 @@ mod tests {
                 revision: 3,
                 nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None }],
                 edges: vec![],
-            probes: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
             },
         );
         state.persist();
@@ -998,7 +1021,7 @@ mod tests {
             revision: 1,
             nodes: vec![],
             edges: vec![],
-            probes: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
         };
         let reply = nc.gossip(&format!("127.0.0.1:{port}"), &msg).await.unwrap();
         assert_eq!(reply.from, 1);
@@ -1240,6 +1263,109 @@ mod tests {
             assert_eq!(t.len(), 2, "{label} must hold both nodes' results after one round");
             assert!(t.contains_key(&("web".into(), 1)), "{label} missing node-1 result");
             assert!(t.contains_key(&("web".into(), 2)), "{label} missing node-2 result");
+        }
+    }
+
+    // ---------- M3.2: ssh matrix sharing ----------
+
+    #[test]
+    fn gossip_message_without_ssh_field_parses() {
+        // wire format from a pre-M3.2 binary
+        let raw = r#"{"from":2,"revision":3,"nodes":[],"edges":[]}"#;
+        let msg: GossipMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.from, 2);
+        assert!(msg.ssh.is_empty());
+    }
+
+    #[test]
+    fn ssh_results_not_persisted_into_config() {
+        let dir = std::env::temp_dir().join("em-m32-nopersist");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let state = NodeState::with_persist(
+            NetworkConfig::bootstrap("s".into(), "n1".into()),
+            path.clone(),
+        );
+        state.record_own_ssh_probe(crate::sshmatrix::SshProbe {
+            from: 1,
+            to: 2,
+            measured_at: Ts(42),
+            outcome: CheckOutcome::Ok { latency_ms: 5 },
+            banner: Some("SSH-2.0-test".into()),
+        });
+        state.persist();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("SSH-2.0-test"), "ssh probe data must not leak into network.toml");
+        assert!(!raw.contains("measured_at"), "probe fields must not leak into network.toml");
+        let before = NetworkConfig::load(&path).unwrap().content_hash.clone();
+        // a gossip carrying ssh rows must not change the persisted admin hash
+        crate::sshmatrix::merge_ssh_probes(
+            &state.ssh_matrix,
+            &[crate::sshmatrix::SshProbe {
+                from: 2,
+                to: 1,
+                measured_at: Ts(50),
+                outcome: CheckOutcome::Ok { latency_ms: 7 },
+                banner: None,
+            }],
+        );
+        state.persist();
+        let after = NetworkConfig::load(&path).unwrap().content_hash;
+        assert_eq!(before, after, "admin_hash must be unaffected by ssh matrix data");
+    }
+
+    #[tokio::test]
+    async fn ssh_matrix_converges_in_one_exchange_round() {
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        let mut cfg_b = NetworkConfig::bootstrap("test-secret".into(), "node-2".into());
+        cfg_b.self_id = 2;
+        cfg_b.nodes[0].id = 2;
+        cfg_a.recompute_hash();
+        cfg_b.recompute_hash();
+
+        let state_a = Arc::new(NodeState::new(cfg_a));
+        let state_b = Arc::new(NodeState::new(cfg_b));
+
+        // each side holds ONLY its own directed rows (A probed B and C,
+        // B probed A and C — as if C is a third node both can see)
+        let own = |from: u32, to: u32| crate::sshmatrix::SshProbe {
+            from,
+            to,
+            measured_at: Ts(1_000),
+            outcome: CheckOutcome::Ok { latency_ms: 10 },
+            banner: Some(format!("SSH-2.0-node{to}")),
+        };
+        state_a.record_own_ssh_probe(own(1, 2));
+        state_b.record_own_ssh_probe(own(2, 1));
+
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_b = lb.local_addr().unwrap().port();
+        let sb = state_b.clone();
+        tokio::spawn(async move { axum::serve(lb, router(sb)).await.unwrap() });
+
+        {
+            let mut g = state_a.cfg.write().unwrap();
+            g.nodes.push(NodeEntry {
+                id: 2,
+                name: "node-2".into(),
+                public_key: None,
+                address: Some(format!("127.0.0.1:{port_b}")), ssh: None,
+            });
+            g.recompute_hash();
+        }
+
+        // ONE round: A pushes (B merges A's rows), B replies (A merges B's)
+        let client_a = NodeClient::new("test-secret".into(), 1);
+        let res = gossip_round(&state_a, &client_a).await;
+        assert!(res[0].1.is_some(), "gossip must succeed");
+
+        for (state, label) in [(&state_a, "A"), (&state_b, "B")] {
+            let m = state.ssh_matrix.read().unwrap();
+            assert_eq!(m.len(), 2, "{label} must hold both directed rows after one round");
+            assert!(m.contains_key(&(1, 2)), "{label} missing row 1->2");
+            assert!(m.contains_key(&(2, 1)), "{label} missing row 2->1");
         }
     }
 

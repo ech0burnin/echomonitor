@@ -110,6 +110,12 @@ pub async fn run(dir: &str) -> Result<()> {
         std::mem::forget(shutdown_tx);
     }
 
+    // M3.2: directed SSH-availability matrix. Every node probes the
+    // sshd of every other configured node (TCP + banner, cheap budgets)
+    // and shares the rows via gossip; 0 disables the loop. Runtime data
+    // only — no persistence, no hash impact.
+    crate::sshmatrix::spawn_ssh_matrix_loop(state.clone());
+
     // M3.6: periodic systemd unit liveness (`units = [...]` config).
     // Results land in the shared state and ride along with /api/state;
     // runtime data only — no gossip merge, no persistence, no hash impact.
@@ -165,6 +171,7 @@ pub async fn status(dir: &str) -> Result<()> {
                 nodes: cfg.nodes.clone(),
                 edges: cfg.edges.clone(),
                 probes: Vec::new(),
+                ssh: Vec::new(),
                 seen: Vec::new(),
                 units: Vec::new(),
             },
@@ -284,6 +291,31 @@ pub async fn status(dir: &str) -> Result<()> {
         }
         if !live {
             println!("  (daemon offline — no probe data can flow)");
+        }
+    }
+    println!();
+    // M3.2: directed SSH-availability matrix, one line per (from -> to)
+    let mut matrix: crate::sshmatrix::SshMatrix = crate::sshmatrix::SshMatrix::new();
+    for p in &msg.ssh {
+        matrix.insert((p.from, p.to), p.clone());
+    }
+    let interval = if cfg.net.ssh_check_interval_secs == 0 {
+        crate::config::DEFAULT_SSH_CHECK_INTERVAL_SECS
+    } else {
+        cfg.net.ssh_check_interval_secs
+    };
+    println!("ssh:");
+    let lines = crate::sshmatrix::build_ssh_report(
+        &msg.nodes,
+        &matrix,
+        crate::checks::chrono_pseudo::Ts::now().unix_ms(),
+        interval,
+    );
+    if lines.is_empty() {
+        println!("  (none configured)");
+    } else {
+        for l in lines {
+            println!("{l}");
         }
     }
     Ok(())

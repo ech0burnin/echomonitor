@@ -11,5 +11,6 @@ pub mod logging;
 pub mod routing;
 pub mod selfstats;
 pub mod sitereport;
+pub mod sshmatrix;
 pub mod transport;
 pub mod tunnel;
