@@ -4,6 +4,7 @@ mod checks;
 mod cli;
 mod config;
 mod crypto;
+mod elector;
 mod logging;
 mod routing;
 mod selfstats;

@@ -24,7 +24,7 @@ use axum::{
     extract::{Request, State},
     http::StatusCode,
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -46,22 +46,44 @@ pub struct NodeState {
     /// M3.3: gossip-shared site probe results, latest per (check_id, node_id).
     /// Runtime-only state: never persisted, never part of admin_hash.
     pub probes: Arc<RwLock<ProbeTable>>,
+    /// M2.5: liveness evidence — node_id -> unix ms of the last successful
+    /// direct gossip with that node (self seeded at boot). Replicated via
+    /// `GossipMessage::seen`, max-merged. Runtime-only, never persisted.
+    pub evidence: Arc<RwLock<crate::elector::Evidence>>,
+    /// M2.5: last computed parent (id), for health/status/redirect.
+    pub parent: RwLock<Option<u32>>,
 }
 
 impl NodeState {
     pub fn new(cfg: NetworkConfig) -> Self {
+        let evidence = seeded_evidence(&cfg);
         Self {
             cfg: Arc::new(RwLock::new(cfg)),
             persist_path: None,
             probes: Arc::new(RwLock::new(HashMap::new())),
+            evidence: Arc::new(RwLock::new(evidence)),
+            parent: RwLock::new(None),
         }
     }
 
     pub fn with_persist(cfg: NetworkConfig, path: std::path::PathBuf) -> Self {
+        let evidence = seeded_evidence(&cfg);
         Self {
             cfg: Arc::new(RwLock::new(cfg)),
             persist_path: Some(path),
             probes: Arc::new(RwLock::new(HashMap::new())),
+            evidence: Arc::new(RwLock::new(evidence)),
+            parent: RwLock::new(None),
+        }
+    }
+
+    /// M2.5: record a successful direct contact with `peer` (either
+    /// direction). Kept per-observer wall clock; merged max-wins.
+    pub fn record_seen(&self, peer: u32, at_ms: u64) {
+        let mut ev = self.evidence.write().unwrap();
+        let e = ev.entry(peer).or_insert(0);
+        if at_ms > *e {
+            *e = at_ms;
         }
     }
 
@@ -94,12 +116,20 @@ impl NodeState {
     pub fn snapshot_msg(&self) -> GossipMessage {
         let g = self.cfg.read().unwrap();
         let probes: Vec<SiteProbe> = self.probes.read().unwrap().values().cloned().collect();
+        let seen: Vec<SeenEntry> = self
+            .evidence
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&id, &at_ms)| SeenEntry { id, at_ms })
+            .collect();
         GossipMessage {
             from: g.self_id,
             revision: g.revision,
             nodes: g.nodes.clone(),
             edges: g.edges.clone(),
             probes,
+            seen,
         }
     }
 }
@@ -116,6 +146,36 @@ pub struct GossipMessage {
     /// from older binaries (no probes field) deserializable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<SiteProbe>,
+    /// M2.5 liveness evidence shared through gossip. Same old-wire safety.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<SeenEntry>,
+}
+
+/// One liveness observation: node `id` was directly reachable at `at_ms`
+/// (observer wall clock). Serialized separately from the HashMap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SeenEntry {
+    pub id: u32,
+    pub at_ms: u64,
+}
+
+fn seeded_evidence(cfg: &NetworkConfig) -> crate::elector::Evidence {
+    let mut ev = crate::elector::Evidence::new();
+    let now = crate::checks::chrono_pseudo::Ts::now().unix_ms();
+    ev.insert(cfg.self_id, now);
+    ev
+}
+
+/// Merge incoming liveness evidence: max per node id (commutative,
+/// associative — all sides of an exchange converge in one round).
+pub fn merge_seen(table: &RwLock<crate::elector::Evidence>, incoming: &[SeenEntry]) {
+    let mut t = table.write().unwrap();
+    for s in incoming {
+        let e = t.entry(s.id).or_insert(0);
+        if s.at_ms > *e {
+            *e = s.at_ms;
+        }
+    }
 }
 
 // ---------- probe merge ----------
@@ -309,6 +369,8 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
                 let ms = t0.elapsed().as_millis() as u64;
                 merge_into(&state.cfg, &reply);
                 merge_probes(&state.probes, &reply.probes);
+                merge_seen(&state.evidence, &reply.seen);
+                state.record_seen(peer_id, crate::checks::chrono_pseudo::Ts::now().unix_ms());
                 set_edge_latency(&state.cfg, self_id, peer_id, ms);
                 tracing::debug!(peer = peer_id, latency_ms = ms, "gossip ok");
                 out.push((peer_id, Some(ms)));
@@ -353,22 +415,36 @@ pub async fn auth_middleware(
 
 async fn health(State(state): State<Arc<NodeState>>) -> Json<serde_json::Value> {
     let g = state.cfg.read().unwrap();
+    let parent_id = *state.parent.read().unwrap();
+    let parent = parent_id.map(|pid| {
+        let n = g.nodes.iter().find(|n| n.id == pid);
+        json!({
+            "id": pid,
+            "name": n.map(|n| n.name.clone()),
+            "addr": n.and_then(|n| n.address.clone()),
+        })
+    });
     Json(json!({
         "status": "ok",
         "node": g.self_name,
         "revision": g.revision,
+        "parent": parent,
     }))
 }
 
-/// Inbound topology gossip: merge the peer's view (config + probe results),
-/// persist the config, reply with our own snapshot (push-pull in a single
-/// round trip). Probe results are runtime state — merged but NOT persisted.
+/// Inbound topology gossip: merge the peer's view (config, probe results,
+/// liveness evidence), persist the config, reply with our own snapshot
+/// (push-pull in a single round trip).
+//
+// Runtime state — merged, NOT persisted.
 async fn gossip(
     State(state): State<Arc<NodeState>>,
     Json(msg): Json<GossipMessage>,
 ) -> Json<GossipMessage> {
     merge_into(&state.cfg, &msg);
     merge_probes(&state.probes, &msg.probes);
+    merge_seen(&state.evidence, &msg.seen);
+    state.record_seen(msg.from, crate::checks::chrono_pseudo::Ts::now().unix_ms());
     state.persist();
     Json(state.snapshot_msg())
 }
@@ -376,6 +452,40 @@ async fn gossip(
 /// Current topology view (auth'd; used by `echomonitor status`).
 async fn state_handler(State(state): State<Arc<NodeState>>) -> Json<GossipMessage> {
     Json(state.snapshot_msg())
+}
+
+/// M2.5: unauthenticated root — point a browser at the elected parent.
+/// 307 to the parent's address when known; otherwise a JSON hint with the
+/// parent id/name and the next hop (NAT'd parent case).
+async fn root_redirect(State(state): State<Arc<NodeState>>) -> Response {
+    let parent_id = *state.parent.read().unwrap();
+    let g = state.cfg.read().unwrap();
+    let parent = parent_id.and_then(|pid| g.nodes.iter().find(|n| n.id == pid));
+    match parent.and_then(|n| n.address.as_deref()) {
+        Some(addr) => {
+            let loc = if addr.starts_with("http://") || addr.starts_with("https://") {
+                addr.to_string()
+            } else {
+                format!("http://{addr}/")
+            };
+            Redirect::temporary(&loc).into_response()
+        }
+        None => {
+            let (id, name) = match parent {
+                Some(n) => (json!(n.id), json!(n.name)),
+                None => (serde_json::Value::Null, serde_json::Value::Null),
+            };
+            let next_hop = parent_id.and_then(|pid| {
+                crate::routing::RoutingTable::build(g.self_id, &g.nodes, &g.edges).next_hop(pid)
+            });
+            Json(json!({
+                "hint": "this node is not the parent",
+                "parent": {"id": id, "name": name},
+                "next_hop": next_hop,
+            }))
+            .into_response()
+        }
+    }
 }
 
 // ---------- client ----------
@@ -444,6 +554,7 @@ impl NodeClient {
 
 pub fn router(state: Arc<NodeState>) -> Router {
     Router::new()
+        .route("/", get(root_redirect))
         .route("/api/health", get(health))
         .route(
             "/api/gossip",
@@ -488,7 +599,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()) },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(7) }],
-            probes: vec![],
+            probes: vec![], seen: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -509,7 +620,7 @@ mod tests {
             revision: 2,
             nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None }],
             edges: vec![],
-            probes: vec![],
+            probes: vec![], seen: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -532,7 +643,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
             ],
             edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
-            probes: vec![],
+            probes: vec![], seen: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -559,7 +670,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
-            probes: vec![],
+            probes: vec![], seen: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -589,11 +700,11 @@ mod tests {
         let msg_a_to_b = shared_a.read().unwrap().clone();
         merge_into(
             &shared_a,
-            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![] },
+            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], seen: vec![] },
         );
         merge_into(
             &shared_b,
-            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![] },
+            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], seen: vec![] },
         );
 
         let ga = shared_a.read().unwrap();
@@ -627,7 +738,7 @@ mod tests {
                 revision: 3,
                 nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None }],
                 edges: vec![],
-            probes: vec![],
+            probes: vec![], seen: vec![],
             },
         );
         state.persist();
@@ -668,7 +779,7 @@ mod tests {
             revision: 1,
             nodes: vec![],
             edges: vec![],
-            probes: vec![],
+            probes: vec![], seen: vec![],
         };
         let reply = nc.gossip(&format!("127.0.0.1:{port}"), &msg).await.unwrap();
         assert_eq!(reply.from, 1);
@@ -911,5 +1022,155 @@ mod tests {
             assert!(t.contains_key(&("web".into(), 1)), "{label} missing node-1 result");
             assert!(t.contains_key(&("web".into(), 2)), "{label} missing node-2 result");
         }
+    }
+
+    // ---------- M2.5 parent election ----------
+
+    fn wire_pair(state_a: &Arc<NodeState>, state_b: &Arc<NodeState>, port_a: u16, port_b: u16) {
+        let mut g = state_a.cfg.write().unwrap();
+        g.nodes.push(NodeEntry {
+            id: 2,
+            name: "node-2".into(),
+            public_key: None,
+            address: Some(format!("127.0.0.1:{port_b}")),
+        });
+        g.recompute_hash();
+        let mut g = state_b.cfg.write().unwrap();
+        g.nodes.push(NodeEntry {
+            id: 1,
+            name: "node-1".into(),
+            public_key: None,
+            address: Some(format!("127.0.0.1:{port_a}")),
+        });
+        g.recompute_hash();
+    }
+
+    async fn spawn_node_router(state: &Arc<NodeState>) -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let s = state.clone();
+        tokio::spawn(async move { axum::serve(l, router(s)).await.unwrap() });
+        port
+    }
+
+    #[tokio::test]
+    async fn two_nodes_agree_on_parent() {
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        let mut cfg_b = NetworkConfig::bootstrap("test-secret".into(), "node-2".into());
+        cfg_b.self_id = 2;
+        cfg_b.nodes[0].id = 2;
+        cfg_a.recompute_hash();
+        cfg_b.recompute_hash();
+
+        let state_a = Arc::new(NodeState::new(cfg_a));
+        let state_b = Arc::new(NodeState::new(cfg_b));
+        let port_a = spawn_node_router(&state_a).await;
+        let port_b = spawn_node_router(&state_b).await;
+        wire_pair(&state_a, &state_b, port_a, port_b);
+
+        let client_a = NodeClient::new("test-secret".into(), 1);
+        let client_b = NodeClient::new("test-secret".into(), 2);
+        assert!(gossip_round(&state_a, &client_a).await[0].1.is_some());
+        assert!(gossip_round(&state_b, &client_b).await[0].1.is_some());
+
+        let now = crate::checks::chrono_pseudo::Ts::now().unix_ms();
+        for state in [&state_a, &state_b] {
+            let g = state.cfg.read().unwrap();
+            let ev = state.evidence.read().unwrap();
+            assert_eq!(
+                crate::elector::elect(&g.nodes, &g.edges, &ev, now),
+                Some(1),
+                "both nodes must elect node-1 (lowest id, rule waived at N=2)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_death_re_elects_on_survivors() {
+        // star: 1<->2, 1<->3; node-1 dies -> no alive-alive edge remains,
+        // strict rule finds no candidate -> degraded fallback to lowest alive
+        let mut cfg1 = NetworkConfig::bootstrap("s".into(), "n1".into());
+        let mut cfg2 = NetworkConfig::bootstrap("s".into(), "n2".into());
+        let mut cfg3 = NetworkConfig::bootstrap("s".into(), "n3".into());
+        cfg2.self_id = 2;
+        cfg3.self_id = 3;
+        cfg2.nodes[0].id = 2;
+        cfg3.nodes[0].id = 3;
+        for c in [&mut cfg1, &mut cfg2, &mut cfg3] {
+            c.recompute_hash();
+        }
+        let s1 = Arc::new(NodeState::new(cfg1));
+        let s2 = Arc::new(NodeState::new(cfg2));
+        let s3 = Arc::new(NodeState::new(cfg3));
+        let p1 = spawn_node_router(&s1).await;
+        let p2 = spawn_node_router(&s2).await;
+        let p3 = spawn_node_router(&s3).await;
+        wire_pair(&s1, &s2, p1, p2);
+        wire_pair(&s1, &s3, p1, p3);
+
+        let c1 = NodeClient::new("s".into(), 1);
+        assert!(gossip_round(&s1, &c1).await.iter().all(|(_, l)| l.is_some()));
+        let c2 = NodeClient::new("s".into(), 2);
+        let c3 = NodeClient::new("s".into(), 3);
+        assert!(gossip_round(&s2, &c2).await[0].1.is_some());
+        assert!(gossip_round(&s3, &c3).await[0].1.is_some());
+
+        let now = crate::checks::chrono_pseudo::Ts::now().unix_ms();
+        // before the crash: node-1 has two alive neighbors -> parent
+        for s in [&s2, &s3] {
+            let g = s.cfg.read().unwrap();
+            let ev = s.evidence.read().unwrap();
+            assert_eq!(crate::elector::elect(&g.nodes, &g.edges, &ev, now), Some(1));
+        }
+
+        // node-1 dies: its evidence goes stale on the survivors
+        for s in [&s2, &s3] {
+            let mut ev = s.evidence.write().unwrap();
+            ev.insert(1, now - crate::elector::T_DEAD_MS - 1);
+        }
+        for s in [&s2, &s3] {
+            let g = s.cfg.read().unwrap();
+            let ev = s.evidence.read().unwrap();
+            assert_eq!(
+                crate::elector::elect(&g.nodes, &g.edges, &ev, now),
+                Some(2),
+                "survivors must re-elect: strict rule finds no candidate (no 2-3 edge), degraded fallback to lowest alive"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_redirects_to_elected_parent() {
+        let mut cfg = NetworkConfig::bootstrap("s".into(), "n2".into());
+        cfg.self_id = 2;
+        cfg.nodes[0].id = 2;
+        cfg.nodes.push(NodeEntry {
+            id: 1,
+            name: "n1".into(),
+            public_key: None,
+            address: Some("10.9.9.9:8687".into()),
+        });
+        cfg.recompute_hash();
+        let state = Arc::new(NodeState::new(cfg));
+        *state.parent.write().unwrap() = Some(1);
+
+        let resp = root_redirect(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get(axum::http::header::LOCATION).unwrap(),
+            "http://10.9.9.9:8687/"
+        );
+    }
+
+    #[test]
+    fn gossip_without_seen_field_parses() {
+        let raw = serde_json::json!({
+            "from": 1, "revision": 1,
+            "nodes": [{"id": 1, "name": "n1"}],
+            "edges": []
+        });
+        let msg: GossipMessage = serde_json::from_value(raw).expect("pre-M2.5 wire must parse");
+        assert!(msg.seen.is_empty());
+        assert!(msg.probes.is_empty());
     }
 }

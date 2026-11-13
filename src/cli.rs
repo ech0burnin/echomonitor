@@ -57,11 +57,33 @@ pub async fn run(dir: &str) -> Result<()> {
         let client = NodeClient::new(secret, self_id);
         let mut tick = tokio::time::interval(Duration::from_secs(interval));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // M2.5: deterministic parent election after each round; act on a
+        // change only once the desired parent held for ELECT_STABILITY rounds.
+        let mut gate = crate::elector::StabilityGate::new();
         loop {
             tick.tick().await;
             let results = transport::gossip_round(&loop_state, &client).await;
             let ok = results.iter().filter(|(_, l)| l.is_some()).count();
             tracing::debug!(peers = results.len(), ok, "gossip round done");
+            let now_ms = crate::checks::chrono_pseudo::Ts::now().unix_ms();
+            let desired = {
+                let g = loop_state.cfg.read().unwrap();
+                let evidence = loop_state.evidence.read().unwrap();
+                crate::elector::elect(&g.nodes, &g.edges, &evidence, now_ms)
+            };
+            let (effective, changed) = gate.observe(desired);
+            *loop_state.parent.write().unwrap() = effective;
+            if changed {
+                match (effective, self_id) {
+                    (Some(p), _) if p == self_id => {
+                        tracing::info!(parent = p, "PARENT role acquired");
+                    }
+                    (Some(p), _) => {
+                        tracing::info!(parent = p, "parent changed");
+                    }
+                    (None, _) => tracing::warn!("no parent eligible"),
+                }
+            }
         }
     });
 
@@ -124,6 +146,7 @@ pub async fn status(dir: &str) -> Result<()> {
                 nodes: cfg.nodes.clone(),
                 edges: cfg.edges.clone(),
                 probes: Vec::new(),
+                seen: Vec::new(),
             },
             false,
         ),
