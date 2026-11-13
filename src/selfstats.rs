@@ -1,9 +1,11 @@
-//! Self-observation: local RAM/LOAD/DISK stats (M3.4).
+//! Self-observation: local RAM/LOAD/DISK stats (M3.4) and systemd unit
+//! liveness (M3.6).
 //!
 //! Pure parsers take `&str` so they are testable on fixtures without
-//! touching the real `/proc`. Only [`SelfStats::collect`] reads live data.
-//! This is deliberately NOT wired into gossip or the config — local-only,
-//! surfaced through `cli status`.
+//! touching the real `/proc`. Only [`SelfStats::collect`] and
+//! [`collect_units`] read live data. Stats are local-only; unit statuses
+//! additionally ride in the node's `/api/state` reply (runtime data,
+//! ignored by peers during gossip merges). Surfaced through `cli status`.
 
 use anyhow::{anyhow, Context, Result};
 use std::io;
@@ -200,6 +202,84 @@ impl SelfStats {
     }
 }
 
+// ---------- M3.6: systemd unit liveness ----------
+
+/// One systemd unit's liveness, as observed via `systemctl is-active`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UnitStatus {
+    pub name: String,
+    pub active: bool,
+}
+
+/// Per-unit wall-clock budget for one `systemctl is-active` probe.
+pub const UNIT_CHECK_TIMEOUT_SECS: u64 = 2;
+
+/// Map a child's exit code to `active`.
+///
+/// `systemctl is-active <unit> --quiet` exits 0 only for an active unit;
+/// any other code (3 = inactive/dead, 4 = missing unit, signals, spawn
+/// failure rendered as `None`) means "not active". Keeping this a pure
+/// function makes the mapping unit-testable without systemd.
+pub fn exit_code_to_active(code: Option<i32>) -> bool {
+    code == Some(0)
+}
+
+/// Probe every configured unit with `systemctl is-active --quiet`.
+///
+/// Units are probed concurrently, each capped at
+/// [`UNIT_CHECK_TIMEOUT_SECS`]; results come back in input order. Errors
+/// of any kind (missing systemctl binary, timeout, unit gone, signal)
+/// yield `active: false` for that unit and never abort the round.
+pub async fn collect_units(names: &[String]) -> Vec<UnitStatus> {
+    use std::process::Stdio;
+    use tokio::task::JoinSet;
+
+    let mut set: JoinSet<(usize, UnitStatus)> = JoinSet::new();
+    for (idx, name) in names.iter().enumerate() {
+        let name = name.clone();
+        set.spawn(async move {
+            let probe = tokio::process::Command::new("systemctl")
+                .arg("is-active")
+                .arg(&name)
+                .arg("--quiet")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            // Probe outcome only matters for the exit code; output is noise.
+            let active = match tokio::time::timeout(
+                std::time::Duration::from_secs(UNIT_CHECK_TIMEOUT_SECS),
+                probe,
+            )
+            .await
+            {
+                Ok(Ok(st)) => exit_code_to_active(st.code()),
+                _ => false,
+            };
+            (idx, UnitStatus { name, active })
+        });
+    }
+
+    let mut slots: Vec<Option<UnitStatus>> = (0..names.len()).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        // A panicked task is an error like any other: leave the slot
+        // empty; it becomes active:false below. The round never aborts.
+        if let Ok((idx, us)) = joined {
+            slots[idx] = Some(us);
+        }
+    }
+    slots
+        .into_iter()
+        .zip(names)
+        .map(|(slot, name)| {
+            slot.unwrap_or(UnitStatus {
+                name: name.clone(),
+                active: false,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +393,54 @@ mod tests {
         assert!(s.load.total_procs > 0);
         assert!(s.disk.total_bytes > 0);
         assert!(s.collected_at > 0);
+    }
+
+    // ---------- M3.6: systemd units ----------
+
+    #[test]
+    fn exit_code_to_active_mapping() {
+        // exit 0 (is-active --quiet on an active unit) -> active
+        assert!(exit_code_to_active(Some(0)));
+        // 3 = inactive, 4 = missing unit, anything else nonzero -> dead
+        assert!(!exit_code_to_active(Some(3)));
+        assert!(!exit_code_to_active(Some(4)));
+        assert!(!exit_code_to_active(Some(1)));
+        // killed by signal / never spawned -> dead
+        assert!(!exit_code_to_active(None));
+    }
+
+    #[test]
+    fn unit_status_serde_roundtrip() {
+        let us = UnitStatus {
+            name: "zeroclaw.service".into(),
+            active: true,
+        };
+        let j = serde_json::to_string(&us).unwrap();
+        assert_eq!(j, r#"{"name":"zeroclaw.service","active":true}"#);
+        let back: UnitStatus = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, us);
+    }
+
+    #[tokio::test]
+    async fn collect_units_empty_input_is_empty_output() {
+        assert!(collect_units(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_units_bad_units_report_dead_in_order() {
+        // Units that cannot be active (they do not exist) must come back
+        // dead, in input order, one entry per input — never an error and
+        // never a dropped entry. Works with or without systemd present:
+        // a missing systemctl binary is a spawn error -> dead too.
+        let names: Vec<String> = ["no-such-unit-a.service", "no-such-unit-b.service"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = collect_units(&names).await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "no-such-unit-a.service");
+        assert_eq!(out[1].name, "no-such-unit-b.service");
+        assert!(!out[0].active);
+        assert!(!out[1].active);
     }
 }

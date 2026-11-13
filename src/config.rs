@@ -35,6 +35,16 @@ pub struct NetworkConfig {
     /// Scheduled HTTP checks ([[checks]] table). Optional, default none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<crate::checks::HttpCheckSpec>,
+    /// M3.6: systemd unit names monitored via `systemctl is-active`.
+    /// Runtime-observability data (same class as edge `latency_ms`):
+    /// NOT part of the admin hash, never bumps revisions when edited.
+    /// Empty (default) = the feature is off, bit-for-bit legacy configs.
+    ///
+    /// NOTE: deliberately a flat key, not `[checks] units`: `checks` is an
+    /// array-of-tables (`[[checks]]`) since M3.1, and TOML forbids using
+    /// the same key as both a table and an array of tables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +210,7 @@ impl NetworkConfig {
             }],
             edges: Vec::new(),
             checks: Vec::new(),
+            units: Vec::new(),
         };
         cfg.recompute_hash();
         cfg
@@ -609,5 +620,69 @@ b = 2
         assert_ne!(host_only.content_hash, M26_GOLDEN);
         assert_ne!(port_only.content_hash, M26_GOLDEN);
         assert_ne!(host_only.content_hash, port_only.content_hash);
+    }
+
+    // ---------- M3.6: systemd units ----------
+
+    #[test]
+    fn units_default_empty_and_roundtrip() {
+        // A legacy config (no units key) parses to an empty list: feature off.
+        let raw = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.units.is_empty());
+
+        // A config with units parses and survives a full save/load roundtrip.
+        let raw_units = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+units = ["zeroclaw.service", "docker.service"]
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw_units).unwrap();
+        assert_eq!(cfg.units, vec!["zeroclaw.service", "docker.service"]);
+
+        let dir = std::env::temp_dir().join("em-m36-config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("network.toml");
+        cfg.save(&p).unwrap();
+        let loaded = NetworkConfig::load(&p).unwrap();
+        assert_eq!(loaded.units, cfg.units);
+
+        // skip_serializing_if: an empty units list writes no key at all —
+        // a legacy config re-saved by this binary stays byte-identical
+        // where it matters (no stray "units = []" noise).
+        let mut legacy = loaded;
+        legacy.units = Vec::new();
+        legacy.save(&p).unwrap();
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("units"));
+    }
+
+    #[test]
+    fn units_do_not_shift_admin_hash() {
+        // Units are runtime observability config (same class as edge
+        // latencies): editing them must NOT change the admin hash.
+        let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
+        let mut b = a.clone();
+        b.units = vec!["zeroclaw.service".into(), "docker.service".into()];
+        a.recompute_hash();
+        b.recompute_hash();
+        assert_eq!(
+            a.content_hash, b.content_hash,
+            "units must not affect the admin hash"
+        );
     }
 }

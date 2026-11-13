@@ -110,6 +110,30 @@ pub async fn run(dir: &str) -> Result<()> {
         std::mem::forget(shutdown_tx);
     }
 
+    // M3.6: periodic systemd unit liveness (`units = [...]` config).
+    // Results land in the shared state and ride along with /api/state;
+    // runtime data only — no gossip merge, no persistence, no hash impact.
+    if !cfg.units.is_empty() {
+        let st = state.clone();
+        let names = cfg.units.clone();
+        tracing::info!(count = names.len(), "unit monitor starting");
+        tokio::spawn(async move {
+            loop {
+                let snapshot = crate::selfstats::collect_units(&names).await;
+                let dead: Vec<&str> = snapshot
+                    .iter()
+                    .filter(|u| !u.active)
+                    .map(|u| u.name.as_str())
+                    .collect();
+                if !dead.is_empty() {
+                    tracing::warn!(units = ?dead, "inactive systemd units");
+                }
+                st.set_units(snapshot);
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
     transport::serve(state, cfg.net.listen_port).await
 }
 
@@ -142,6 +166,7 @@ pub async fn status(dir: &str) -> Result<()> {
                 edges: cfg.edges.clone(),
                 probes: Vec::new(),
                 seen: Vec::new(),
+                units: Vec::new(),
             },
             false,
         ),
@@ -212,6 +237,21 @@ pub async fn status(dir: &str) -> Result<()> {
                 s.disk.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
         }
         Err(e) => println!("self: (unavailable: {e})"),
+    }
+    // M3.6: systemd unit liveness. Live daemon -> straight from its
+    // /api/state reply (the monitor loop keeps it fresh); offline or a
+    // daemon that has not collected yet -> probe locally right now.
+    if !cfg.units.is_empty() {
+        let units = if live && !msg.units.is_empty() {
+            msg.units.clone()
+        } else {
+            crate::selfstats::collect_units(&cfg.units).await
+        };
+        let rendered: Vec<String> = units
+            .iter()
+            .map(|u| format!("{} {}", u.name, if u.active { "active" } else { "dead" }))
+            .collect();
+        println!("  units {}", rendered.join(", "));
     }
     println!();
     let table = routing::RoutingTable::build(cfg.self_id, &msg.nodes, &msg.edges);

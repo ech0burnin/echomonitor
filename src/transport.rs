@@ -52,6 +52,10 @@ pub struct NodeState {
     pub evidence: Arc<RwLock<crate::elector::Evidence>>,
     /// M2.5: last computed parent (id), for health/status/redirect.
     pub parent: RwLock<Option<u32>>,
+    /// M3.6: last observed systemd unit liveness on THIS node (filled by
+    /// the daemon's unit monitor loop). Runtime-only state: never
+    /// persisted, never part of admin_hash, ignored by peers on merge.
+    pub units: Arc<RwLock<Vec<crate::selfstats::UnitStatus>>>,
     /// M2.6: SSH fallback tunnel manager (tokio Mutex — building a tunnel
     /// is async). None when `node.key` is absent/unusable (tests, plain
     /// status runs): no node gets a tunnel, behavior is M2.5-identical.
@@ -67,6 +71,7 @@ impl NodeState {
             probes: Arc::new(RwLock::new(HashMap::new())),
             evidence: Arc::new(RwLock::new(evidence)),
             parent: RwLock::new(None),
+            units: Arc::new(RwLock::new(Vec::new())),
             tunnels: tokio::sync::Mutex::new(None),
         }
     }
@@ -79,6 +84,7 @@ impl NodeState {
             probes: Arc::new(RwLock::new(HashMap::new())),
             evidence: Arc::new(RwLock::new(evidence)),
             parent: RwLock::new(None),
+            units: Arc::new(RwLock::new(Vec::new())),
             tunnels: tokio::sync::Mutex::new(None),
         }
     }
@@ -97,6 +103,12 @@ impl NodeState {
     pub fn record_own_probe(&self, probe: SiteProbe) {
         let mut t = self.probes.write().unwrap();
         t.insert((probe.check_id.clone(), probe.node_id), probe);
+    }
+
+    /// M3.6: replace the shared unit-liveness snapshot (writer: the
+    /// daemon's periodic unit monitor; readers: snapshot_msg/api state).
+    pub fn set_units(&self, units: Vec<crate::selfstats::UnitStatus>) {
+        *self.units.write().unwrap() = units;
     }
 
     /// Atomically persist the current config view (tmp file + rename).
@@ -136,6 +148,7 @@ impl NodeState {
             edges: g.edges.clone(),
             probes,
             seen,
+            units: self.units.read().unwrap().clone(),
         }
     }
 }
@@ -155,6 +168,12 @@ pub struct GossipMessage {
     /// M2.5 liveness evidence shared through gossip. Same old-wire safety.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seen: Vec<SeenEntry>,
+    /// M3.6: THIS node's systemd unit liveness, served with `/api/state`.
+    /// Local observation only: peers ignore it when merging gossip (there
+    /// is nothing to merge — each node reports its own units). Same
+    /// old-wire safety as probes/seen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<crate::selfstats::UnitStatus>,
 }
 
 /// One liveness observation: node `id` was directly reachable at `at_ms`
@@ -755,6 +774,36 @@ pub async fn serve(state: Arc<NodeState>, port: u16) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    // ---------- M3.6: unit liveness in state replies ----------
+
+    #[test]
+    fn snapshot_msg_carries_units() {
+        let state = test_state();
+        state.set_units(vec![
+            crate::selfstats::UnitStatus { name: "zeroclaw.service".into(), active: true },
+            crate::selfstats::UnitStatus { name: "docker.service".into(), active: false },
+        ]);
+        let msg = state.snapshot_msg();
+        assert_eq!(msg.units.len(), 2);
+        assert!(msg.units[0].active);
+        assert!(!msg.units[1].active);
+        // and it serializes into the /api/state wire format
+        let j = serde_json::to_value(&msg).unwrap();
+        assert_eq!(j["units"][0]["name"], "zeroclaw.service");
+        assert_eq!(j["units"][1]["active"], false);
+    }
+
+    #[test]
+    fn gossip_message_without_units_still_parses() {
+        // Pre-M3.6 wire format (no units key) must stay deserializable.
+        let raw = r#"{
+            "from": 2, "revision": 1,
+            "nodes": [], "edges": [], "probes": [], "seen": []
+        }"#;
+        let msg: GossipMessage = serde_json::from_str(raw).expect("legacy message parses");
+        assert!(msg.units.is_empty());
+    }
+
     // ---------- merge unit tests ----------
 
     #[test]
@@ -769,7 +818,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()), ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(7) }],
-            probes: vec![], seen: vec![],
+            probes: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -790,7 +839,7 @@ mod tests {
             revision: 2,
             nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None, ssh: None }],
             edges: vec![],
-            probes: vec![], seen: vec![],
+            probes: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -813,7 +862,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
-            probes: vec![], seen: vec![],
+            probes: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -840,7 +889,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
-            probes: vec![], seen: vec![],
+            probes: vec![], seen: vec![], units: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -870,11 +919,11 @@ mod tests {
         let msg_a_to_b = shared_a.read().unwrap().clone();
         merge_into(
             &shared_a,
-            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], seen: vec![] },
+            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], seen: vec![], units: vec![] },
         );
         merge_into(
             &shared_b,
-            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], seen: vec![] },
+            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], seen: vec![], units: vec![] },
         );
 
         let ga = shared_a.read().unwrap();
@@ -908,7 +957,7 @@ mod tests {
                 revision: 3,
                 nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None }],
                 edges: vec![],
-            probes: vec![], seen: vec![],
+            probes: vec![], seen: vec![], units: vec![],
             },
         );
         state.persist();
@@ -949,7 +998,7 @@ mod tests {
             revision: 1,
             nodes: vec![],
             edges: vec![],
-            probes: vec![], seen: vec![],
+            probes: vec![], seen: vec![], units: vec![],
         };
         let reply = nc.gossip(&format!("127.0.0.1:{port}"), &msg).await.unwrap();
         assert_eq!(reply.from, 1);
