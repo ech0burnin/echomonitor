@@ -8,6 +8,10 @@
 //! Gossip then talks plain HTTP to `127.0.0.1:<ephemeral>` — the NodeClient
 //! is completely unaware of the tunnel.
 //!
+//! M2.8 jump: `SshDial.forward_host`/`forward_port` retarget those channels
+//! at a third host, so a direct-unreachable peer can be dialed THROUGH a
+//! reachable jumper's sshd (the jumper resolves and connects the target).
+//!
 //! Host keys are verified TOFU-style (trust on first use) against a local
 //! `ssh_known_hosts` pin file: first contact pins the key with a loud warn,
 //! any later mismatch is a HARD FAIL (suspected MITM).
@@ -44,19 +48,35 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// the next gossip round rebuilds the tunnel.
 const KEEPALIVE_MAX: usize = 3;
 
-/// Where a peer's sshd lives (derived from `NodeEntry.ssh`).
+/// Where a peer's sshd lives (derived from `NodeEntry.ssh`) and where its
+/// `direct-tcpip` channels connect.
 pub struct TunnelSpec {
-    /// `host:port` of the peer's sshd.
+    /// `host:port` of the peer's (or, for a jump entry, the jumper's) sshd.
     pub ssh_addr: String,
     /// Remote user to authenticate as.
     pub user: String,
+    /// M2.8: host the sshd-side channel connects to. Default `127.0.0.1`
+    /// (the sshd's own loopback, M2.6 behavior); a jump entry sets it from
+    /// `SshDial.forward_host` (resolved by the sshd, not by us).
+    pub fwd_host: String,
+    /// M2.8: port on the forward target. Defaults to the peer's
+    /// network-global `net.listen_port` (passed as `default_port`).
+    pub fwd_port: u16,
 }
 
 impl TunnelSpec {
-    pub fn from_dial(dial: &SshDial) -> Self {
+    /// `default_port` is the dialer's `net.listen_port`: network-global, so
+    /// it equals the peer's gossip port unless a jump entry overrides it
+    /// with `forward_port`.
+    pub fn from_dial(dial: &SshDial, default_port: u16) -> Self {
         Self {
             ssh_addr: format!("{}:{}", dial.host, dial.port),
             user: dial.user.clone(),
+            fwd_host: dial
+                .forward_host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".into()),
+            fwd_port: dial.forward_port.unwrap_or(default_port),
         }
     }
 }
@@ -126,12 +146,7 @@ impl TunnelManager {
     /// Local endpoint for the peer's tunnel. Returns the existing one when
     /// the session is alive; rebuilds (connect + auth + rebind listener)
     /// when missing or dead. One build attempt per call.
-    pub async fn endpoint(
-        &mut self,
-        peer: u32,
-        spec: &TunnelSpec,
-        peer_http_port: u16,
-    ) -> Result<SocketAddr> {
+    pub async fn endpoint(&mut self, peer: u32, spec: &TunnelSpec) -> Result<SocketAddr> {
         if let Some(t) = self.tunnels.get(&peer) {
             if !t.handle.is_closed() {
                 return Ok(t.local);
@@ -139,7 +154,7 @@ impl TunnelManager {
             tracing::warn!(peer, "ssh tunnel connection lost; rebuilding");
         }
         self.drop_tunnel(peer);
-        let t = self.build(peer, spec, peer_http_port).await?;
+        let t = self.build(peer, spec).await?;
         let local = t.local;
         self.tunnels.insert(peer, t);
         Ok(local)
@@ -173,17 +188,18 @@ impl TunnelManager {
         self.tunnels.is_empty()
     }
 
-    async fn build(
-        &self,
-        peer: u32,
-        spec: &TunnelSpec,
-        peer_http_port: u16,
-    ) -> Result<Tunnel> {
+    async fn build(&self, peer: u32, spec: &TunnelSpec) -> Result<Tunnel> {
         let config = Arc::new(client::Config {
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
             keepalive_max: KEEPALIVE_MAX,
             ..Default::default()
         });
+        // TOFU pin key: the JUMPER's `ssh_addr` (config-declared host:port).
+        // For a jump entry the forward target beyond the sshd is NOT
+        // host-key-verified — it is trusted via the jumper only, exactly
+        // like any other plaintext-HTTP gossip responder. The pin itself
+        // stays keyed on the ssh host:port string, so a domain-keyed pin
+        // survives IP rotation.
         let handler = TofuHandler {
             pins_path: self.pins_path.clone(),
             host: spec.ssh_addr.clone(),
@@ -219,22 +235,21 @@ impl TunnelManager {
         let local = listener.local_addr()?;
         let handle = Arc::new(handle);
         let fwd = handle.clone();
+        // M2.8: the channel connects where TunnelSpec says — the sshd's own
+        // loopback gossip port by default, or `SshDial.forward_*` for a jump
+        // entry. The target name is resolved BY the sshd we dialed, not by
+        // us (it may be a name only the jumper can resolve).
+        let fwd_host = spec.fwd_host.clone();
+        let fwd_port = spec.fwd_port;
         let fwd_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((mut sock, _)) => {
                         let fwd = fwd.clone();
+                        let fwd_host = fwd_host.clone();
                         tokio::spawn(async move {
-                            // The tunnel always targets the peer's own HTTP
-                            // port on ITS loopback: net.listen_port is
-                            // network-global, so the peer's port is known.
                             match fwd
-                                .channel_open_direct_tcpip(
-                                    "127.0.0.1",
-                                    peer_http_port as u32,
-                                    "127.0.0.1",
-                                    0,
-                                )
+                                .channel_open_direct_tcpip(fwd_host, fwd_port as u32, "127.0.0.1", 0)
                                 .await
                             {
                                 Ok(channel) => {
@@ -392,17 +407,49 @@ mod tests {
 
     #[test]
     fn tunnel_spec_from_dial_formats_addr() {
-        let spec = TunnelSpec::from_dial(&SshDial {
+        let legacy = SshDial {
             host: "203.0.113.5".into(),
             port: 2222,
             user: "op".into(),
-        });
+            forward_host: None,
+            forward_port: None,
+        };
+        let spec = TunnelSpec::from_dial(&legacy, 8687);
         assert_eq!(spec.ssh_addr, "203.0.113.5:2222");
         assert_eq!(spec.user, "op");
+        // no forward fields -> M2.6 target bit-for-bit: jumper's own
+        // loopback + the network-global listen port passed as default
+        assert_eq!(spec.fwd_host, "127.0.0.1");
+        assert_eq!(spec.fwd_port, 8687);
+
+        // jump entry: both fields override the default target
+        let jump = SshDial {
+            host: "docs.example.internal".into(),
+            port: 22,
+            user: "deploy".into(),
+            forward_host: Some("vps2.example.org".into()),
+            forward_port: Some(8688),
+        };
+        let spec = TunnelSpec::from_dial(&jump, 8687);
+        assert_eq!(spec.ssh_addr, "docs.example.internal:22");
+        assert_eq!(spec.fwd_host, "vps2.example.org");
+        assert_eq!(spec.fwd_port, 8688);
+
+        // forward_port alone retargets the port only
+        let port_only = SshDial { forward_host: None, forward_port: Some(9), ..jump.clone() };
+        let spec = TunnelSpec::from_dial(&port_only, 8687);
+        assert_eq!(spec.fwd_host, "127.0.0.1");
+        assert_eq!(spec.fwd_port, 9);
+
         // defaults land on the documented constants
-        let d = TunnelSpec::from_dial(&SshDial { host: "h".into(), port: DEFAULT_SSH_PORT, user: DEFAULT_SSH_USER.into() });
+        let d = TunnelSpec::from_dial(
+            &SshDial { host: "h".into(), port: DEFAULT_SSH_PORT, user: DEFAULT_SSH_USER.into(), forward_host: None, forward_port: None },
+            crate::config::DEFAULT_LISTEN_PORT,
+        );
         assert_eq!(d.ssh_addr, "h:22");
         assert_eq!(d.user, "root");
+        assert_eq!(d.fwd_host, "127.0.0.1");
+        assert_eq!(d.fwd_port, 8687);
     }
 
     #[test]
@@ -589,7 +636,7 @@ mod tests {
             name: "node-2".into(),
             public_key: None,
             address: None,
-            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user() }),
+            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user(), forward_host: None, forward_port: None }),
         });
         cfg_a.recompute_hash();
         let state_a = Arc::new(crate::transport::NodeState::new(cfg_a));
@@ -660,7 +707,7 @@ mod tests {
             name: "node-2".into(),
             public_key: None,
             address: Some("127.0.0.1:1".into()),
-            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user() }),
+            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user(), forward_host: None, forward_port: None }),
         });
         cfg_a.recompute_hash();
         let state_a = Arc::new(crate::transport::NodeState::new(cfg_a));
@@ -705,7 +752,7 @@ mod tests {
             name: "node-2".into(),
             public_key: None,
             address: None,
-            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user() }),
+            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user(), forward_host: None, forward_port: None }),
         });
         cfg_a.recompute_hash();
         let state_a = Arc::new(crate::transport::NodeState::new(cfg_a));
@@ -746,7 +793,7 @@ mod tests {
             name: "node-2".into(),
             public_key: None,
             address: None,
-            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user() }),
+            ssh: Some(SshDial { host: "127.0.0.1".into(), port, user: current_user(), forward_host: None, forward_port: None }),
         });
         cfg_a.recompute_hash();
         let state_a = Arc::new(crate::transport::NodeState::new(cfg_a));
@@ -758,6 +805,147 @@ mod tests {
         let res = crate::transport::gossip_round(&state_a, &client).await;
         assert!(res[0].1.is_none(), "rejected pubkey auth must fail the round");
         assert!(state_a.tunnels.lock().await.as_ref().unwrap().is_empty());
+
+        drop(sshd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- M2.8: forward jump through a reachable sshd ----------
+
+    #[tokio::test]
+    async fn jump_forward_gossip_reaches_peer_via_jumper() {
+        if !sshd_available() {
+            eprintln!("skipping: no /usr/sbin/sshd or ssh-keygen");
+            return;
+        }
+        let dir = fixture_dir("jump");
+        let keys = crate::crypto::KeyPair::generate();
+        let auth_line = openssh_public_line(&keys.public_hex).unwrap();
+        let port = free_port();
+        let mut sshd = spawn_sshd(&dir, &auth_line, port).expect("spawn sshd");
+        wait_sshd(&mut sshd).await;
+
+        // B ("VPS2"): plain gossip router, reachable ONLY on its loopback
+        let (_state_b, b_port) = spawn_nat_peer("test-secret").await;
+
+        // A ("RF node"): B's direct address is a black hole; the ONLY route
+        // is the jump entry — dial the sshd ("VPS6") and let IT connect to
+        // localhost:b_port (forward_host resolved by the sshd, proving the
+        // target is executed on the jumper side, not the client side).
+        // A's own listen_port points at a dead port: if the code ignored
+        // forward_port and fell back to the M2.6 default, nothing would
+        // answer there and the round would fail.
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        cfg_a.net.listen_port = 1;
+        cfg_a.nodes.push(NodeEntry {
+            id: 2,
+            name: "node-2".into(),
+            public_key: None,
+            address: Some("127.0.0.1:1".into()),
+            ssh: Some(SshDial {
+                host: "127.0.0.1".into(),
+                port,
+                user: current_user(),
+                forward_host: Some("localhost".into()),
+                forward_port: Some(b_port),
+            }),
+        });
+        cfg_a.recompute_hash();
+        let state_a = Arc::new(crate::transport::NodeState::new(cfg_a));
+        *state_a.tunnels.lock().await = Some(
+            TunnelManager::new(&keys.secret_hex, dir.join("ssh_known_hosts")).unwrap(),
+        );
+
+        let client = crate::transport::NodeClient::new("test-secret".into(), 1);
+        let res = crate::transport::gossip_round(&state_a, &client).await;
+        assert_eq!(res.len(), 1);
+        assert!(res[0].1.is_some(), "gossip must succeed through the ssh jump");
+
+        // push-pull through the jump: A adopted B's snapshot
+        assert_eq!(state_a.cfg.read().unwrap().nodes.len(), 2);
+        assert!(
+            state_a.evidence.read().unwrap().contains_key(&2),
+            "jump gossip must refresh liveness evidence for the peer"
+        );
+        assert!(
+            state_a
+                .cfg
+                .read()
+                .unwrap()
+                .edges
+                .iter()
+                .any(|e| e.a == 1 && e.b == 2 && e.latency_ms.is_some()),
+            "honest edge latency through the jump"
+        );
+
+        // TOFU: exactly one pin, for the JUMPER's sshd — the forward target
+        // is never host-key-verified (trusted via the jumper only)
+        let pins = std::fs::read_to_string(dir.join("ssh_known_hosts")).unwrap();
+        assert_eq!(pins.lines().count(), 1, "one pin: {pins}");
+        assert!(pins.starts_with(&format!("127.0.0.1:{port} SHA256:")));
+
+        // round 2: live tunnel REUSED (no rebuild, no new pin), still ok
+        let res2 = crate::transport::gossip_round(&state_a, &client).await;
+        assert!(res2[0].1.is_some());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ssh_known_hosts")).unwrap().lines().count(),
+            1
+        );
+        assert_eq!(state_a.tunnels.lock().await.as_ref().unwrap().len(), 1);
+
+        drop(sshd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn jump_forward_unresolvable_target_fails_round_cleanly() {
+        if !sshd_available() {
+            eprintln!("skipping: no /usr/sbin/sshd or ssh-keygen");
+            return;
+        }
+        let dir = fixture_dir("jumpbad");
+        let keys = crate::crypto::KeyPair::generate();
+        let auth_line = openssh_public_line(&keys.public_hex).unwrap();
+        let port = free_port();
+        let mut sshd = spawn_sshd(&dir, &auth_line, port).expect("spawn sshd");
+        wait_sshd(&mut sshd).await;
+        let (_state_b, b_port) = spawn_nat_peer("test-secret").await;
+
+        // forward target the jumper cannot resolve: the ssh session itself
+        // is fine (connect+auth ok), but every channel open fails -> the
+        // gossip request dies, the round fails, the tunnel is noted dead.
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        cfg_a.net.listen_port = b_port;
+        cfg_a.nodes.push(NodeEntry {
+            id: 2,
+            name: "node-2".into(),
+            public_key: None,
+            address: None,
+            ssh: Some(SshDial {
+                host: "127.0.0.1".into(),
+                port,
+                user: current_user(),
+                forward_host: Some("no-such-host.invalid".into()),
+                forward_port: Some(b_port),
+            }),
+        });
+        cfg_a.recompute_hash();
+        let state_a = Arc::new(crate::transport::NodeState::new(cfg_a));
+        *state_a.tunnels.lock().await = Some(
+            TunnelManager::new(&keys.secret_hex, dir.join("ssh_known_hosts")).unwrap(),
+        );
+
+        let client = crate::transport::NodeClient::new("test-secret".into(), 1);
+        let res = crate::transport::gossip_round(&state_a, &client).await;
+        assert_eq!(res.len(), 1);
+        assert!(res[0].1.is_none(), "unresolvable forward target must fail the round");
+        assert!(
+            state_a.tunnels.lock().await.as_ref().unwrap().is_empty(),
+            "failed gossip must drop the tunnel for a clean rebuild next round"
+        );
+        // the jumper itself was legitimately pinned (TOFU saw its real key)
+        let pins = std::fs::read_to_string(dir.join("ssh_known_hosts")).unwrap();
+        assert!(pins.starts_with(&format!("127.0.0.1:{port} SHA256:")));
 
         drop(sshd);
         let _ = std::fs::remove_dir_all(&dir);

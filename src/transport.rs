@@ -281,13 +281,25 @@ fn pick_opt(a: Option<String>, b: Option<String>) -> Option<String> {
 
 /// Field merge for `SshDial` — same commutative rules as the string fields
 /// (lexicographic max per field, max for port), so both sides of an exchange
-/// converge to the identical entry in one round.
+/// converge to the identical entry in one round. M2.8: the forward fields
+/// follow the same rules (Option fill-in / max) individually —
+/// `forward_host` and `forward_port` never force each other to be set.
+fn pick_opt_u16(a: Option<u16>, b: Option<u16>) -> Option<u16> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
 fn merge_ssh(local: &Option<crate::config::SshDial>, remote: &Option<crate::config::SshDial>) -> Option<crate::config::SshDial> {
     match (local, remote) {
         (Some(a), Some(b)) => Some(crate::config::SshDial {
             host: a.host.clone().max(b.host.clone()),
             user: a.user.clone().max(b.user.clone()),
             port: a.port.max(b.port),
+            forward_host: pick_opt(a.forward_host.clone(), b.forward_host.clone()),
+            forward_port: pick_opt_u16(a.forward_port, b.forward_port),
         }),
         (Some(x), None) | (None, Some(x)) => Some(x.clone()),
         (None, None) => None,
@@ -461,17 +473,19 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
 }
 
 /// Ask the node's TunnelManager for a local endpoint towards the peer,
-/// building/rebuilding the tunnel when needed.
+/// building/rebuilding the tunnel when needed. `peer_http_port` is the
+/// network-global `net.listen_port` — the DEFAULT forward target port,
+/// overridden per-entry by `SshDial.forward_port`.
 async fn tunnel_endpoint(
     state: &NodeState,
     peer: u32,
     ssh: &crate::config::SshDial,
     peer_http_port: u16,
 ) -> anyhow::Result<SocketAddr> {
-    let spec = crate::tunnel::TunnelSpec::from_dial(ssh);
+    let spec = crate::tunnel::TunnelSpec::from_dial(ssh, peer_http_port);
     let mut guard = state.tunnels.lock().await;
     match guard.as_mut() {
-        Some(tm) => tm.endpoint(peer, &spec, peer_http_port).await,
+        Some(tm) => tm.endpoint(peer, &spec).await,
         None => Err(anyhow::anyhow!("no tunnel manager (node.key missing?)")),
     }
 }
@@ -581,6 +595,16 @@ async fn root_redirect(State(state): State<Arc<NodeState>>) -> Response {
 
 // ---------- client ----------
 
+/// Strip an accidental `http(s)://` scheme from a configured address.
+/// `address` is a bare `host:port` (IP or domain); a scheme-carrying value
+/// pasted from a browser would produce `http://http://…` URLs below.
+/// (`root_redirect` already tolerates schemes the same way.)
+fn strip_scheme(addr: &str) -> &str {
+    let a = addr.trim();
+    let a = a.strip_prefix("https://").unwrap_or(a);
+    a.strip_prefix("http://").unwrap_or(a)
+}
+
 pub struct NodeClient {
     pub http: reqwest::Client,
     pub network_secret: Arc<str>,
@@ -615,13 +639,13 @@ impl NodeClient {
     }
 
     pub async fn health(&self, addr: &str) -> anyhow::Result<serde_json::Value> {
-        let url = format!("http://{addr}/api/health");
+        let url = format!("http://{}/api/health", strip_scheme(addr));
         let resp = self.http.get(&url).headers(self.auth_headers()).send().await?;
         Ok(resp.json().await?)
     }
 
     pub async fn gossip(&self, addr: &str, msg: &GossipMessage) -> anyhow::Result<GossipMessage> {
-        let url = format!("http://{addr}/api/gossip");
+        let url = format!("http://{}/api/gossip", strip_scheme(addr));
         let resp = self
             .http
             .post(&url)
@@ -634,7 +658,7 @@ impl NodeClient {
     }
 
     pub async fn state(&self, addr: &str) -> anyhow::Result<GossipMessage> {
-        let url = format!("http://{addr}/api/state");
+        let url = format!("http://{}/api/state", strip_scheme(addr));
         let resp = self.http.get(&url).headers(self.auth_headers()).send().await?;
         let resp = resp.error_for_status()?;
         Ok(resp.json().await?)
@@ -1128,6 +1152,8 @@ mod tests {
                 host: "10.0.0.5".into(),
                 port: 22,
                 user: "root".into(),
+                forward_host: None,
+                forward_port: None,
             }),
         };
         let remote = NodeEntry {
@@ -1139,6 +1165,8 @@ mod tests {
                 host: "10.0.0.9".into(),
                 port: 2222,
                 user: "op".into(),
+                forward_host: None,
+                forward_port: None,
             }),
         };
         let ab = merge_node_entry(&local, &remote);
@@ -1146,7 +1174,7 @@ mod tests {
         assert_eq!(ab, ba, "merge must be commutative");
         assert_eq!(
             ab.ssh,
-            Some(crate::config::SshDial { host: "10.0.0.9".into(), port: 2222, user: "root".into() }),
+            Some(crate::config::SshDial { host: "10.0.0.9".into(), port: 2222, user: "root".into(), forward_host: None, forward_port: None }),
             "lexicographic max per field, numeric max for port"
         );
 
@@ -1154,7 +1182,7 @@ mod tests {
         let none_ssh = NodeEntry { id: 2, name: "n".into(), public_key: None, address: None, ssh: None };
         assert_eq!(
             merge_node_entry(&none_ssh, &remote).ssh,
-            Some(crate::config::SshDial { host: "10.0.0.9".into(), port: 2222, user: "op".into() })
+            Some(crate::config::SshDial { host: "10.0.0.9".into(), port: 2222, user: "op".into(), forward_host: None, forward_port: None })
         );
         assert_eq!(merge_node_entry(&none_ssh, &none_ssh).ssh, None);
     }
@@ -1307,5 +1335,179 @@ mod tests {
         let msg: GossipMessage = serde_json::from_value(raw).expect("pre-M2.5 wire must parse");
         assert!(msg.seen.is_empty());
         assert!(msg.probes.is_empty());
+    }
+
+    // ---------- M2.8: domain addressing ----------
+
+    #[test]
+    fn nodeclient_strips_accidental_scheme() {
+        assert_eq!(strip_scheme("10.0.0.9:8687"), "10.0.0.9:8687");
+        assert_eq!(strip_scheme("http://10.0.0.9:8687"), "10.0.0.9:8687");
+        assert_eq!(strip_scheme("https://docs.example.internal:8687"), "docs.example.internal:8687");
+        assert_eq!(strip_scheme("  http://h:1  "), "h:1");
+        // untouched when no scheme: a domain address passes through verbatim
+        assert_eq!(strip_scheme("docs.example.internal:8687"), "docs.example.internal:8687");
+    }
+
+    #[tokio::test]
+    async fn gossip_round_converges_two_nodes_by_domain() {
+        // Same shape as gossip_round_converges_two_nodes, but the addresses
+        // are the NAME "localhost" instead of an IP literal — proving the
+        // resolver path end-to-end: reqwest resolves the name at dial time
+        // (getaddrinfo), nothing in the config layer parses it as an IP.
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        let mut cfg_b = NetworkConfig::bootstrap("test-secret".into(), "node-2".into());
+        cfg_b.self_id = 2;
+        cfg_b.nodes[0].id = 2;
+        cfg_a.recompute_hash();
+        cfg_b.recompute_hash();
+
+        let state_a = Arc::new(NodeState::new(cfg_a));
+        let state_b = Arc::new(NodeState::new(cfg_b));
+
+        let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_a = la.local_addr().unwrap().port();
+        let port_b = lb.local_addr().unwrap().port();
+        let sa = state_a.clone();
+        tokio::spawn(async move { axum::serve(la, router(sa)).await.unwrap() });
+        let sb = state_b.clone();
+        tokio::spawn(async move { axum::serve(lb, router(sb)).await.unwrap() });
+
+        {
+            let mut g = state_a.cfg.write().unwrap();
+            g.nodes.push(NodeEntry {
+                id: 2,
+                name: "node-2".into(),
+                public_key: None,
+                address: Some(format!("localhost:{port_b}")), ssh: None,
+            });
+            g.recompute_hash();
+        }
+        {
+            let mut g = state_b.cfg.write().unwrap();
+            g.nodes.push(NodeEntry {
+                id: 1,
+                name: "node-1".into(),
+                public_key: None,
+                address: Some(format!("localhost:{port_a}")), ssh: None,
+            });
+            g.recompute_hash();
+        }
+
+        let client_a = NodeClient::new("test-secret".into(), 1);
+        let res = gossip_round(&state_a, &client_a).await;
+        assert_eq!(res.len(), 1);
+        assert!(res[0].1.is_some(), "gossip by domain name should succeed");
+        assert_eq!(state_a.cfg.read().unwrap().nodes.len(), 2);
+
+        let client_b = NodeClient::new("test-secret".into(), 2);
+        let res_b = gossip_round(&state_b, &client_b).await;
+        assert!(res_b[0].1.is_some());
+        assert_eq!(state_b.cfg.read().unwrap().nodes.len(), 2);
+        assert!(
+            state_b
+                .cfg
+                .read()
+                .unwrap()
+                .edges
+                .iter()
+                .any(|e| e.a == 1 && e.b == 2 && e.latency_ms.is_some()),
+            "latency measured over the name-dialed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_redirect_accepts_domain_address() {
+        let mut cfg = NetworkConfig::bootstrap("s".into(), "n2".into());
+        cfg.self_id = 2;
+        cfg.nodes[0].id = 2;
+        cfg.nodes.push(NodeEntry {
+            id: 1,
+            name: "n1".into(),
+            public_key: None,
+            address: Some("docs.example.internal:8687".into()), ssh: None,
+        });
+        cfg.recompute_hash();
+        let state = Arc::new(NodeState::new(cfg));
+        *state.parent.write().unwrap() = Some(1);
+
+        let resp = root_redirect(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get(axum::http::header::LOCATION).unwrap(),
+            "http://docs.example.internal:8687/"
+        );
+    }
+
+    // ---------- M2.8: forward-jump field merge ----------
+
+    #[test]
+    fn merge_node_entry_ssh_forward_fields_are_commutative() {
+        let plain = crate::config::SshDial {
+            host: "10.0.0.9".into(),
+            port: 2222,
+            user: "op".into(),
+            forward_host: None,
+            forward_port: None,
+        };
+        let jumped = crate::config::SshDial {
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "root".into(),
+            forward_host: Some("vps2.example.org".into()),
+            forward_port: Some(8687),
+        };
+        let mk = |ssh| NodeEntry {
+            id: 2,
+            name: "n".into(),
+            public_key: None,
+            address: None,
+            ssh: Some(ssh),
+        };
+        let a = mk(plain.clone());
+        let b = mk(jumped.clone());
+
+        let ab = merge_node_entry(&a, &b);
+        let ba = merge_node_entry(&b, &a);
+        assert_eq!(ab, ba, "forward-field merge must be commutative");
+        // one-sided fill wins over None (admin intent union)
+        assert_eq!(
+            ab.ssh,
+            Some(crate::config::SshDial {
+                host: "10.0.0.9".into(),
+                port: 2222,
+                user: "root".into(),
+                forward_host: Some("vps2.example.org".into()),
+                forward_port: Some(8687),
+            })
+        );
+
+        // conflicting forward fields resolve to the max, still commutative
+        let other_jump = mk(crate::config::SshDial {
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "root".into(),
+            forward_host: Some("aaa.example.org".into()),
+            forward_port: Some(9999),
+        });
+        let x = merge_node_entry(&b, &other_jump);
+        let y = merge_node_entry(&other_jump, &b);
+        assert_eq!(x, y);
+        assert_eq!(x.ssh.as_ref().unwrap().forward_host.as_deref(), Some("vps2.example.org"));
+        assert_eq!(x.ssh.as_ref().unwrap().forward_port, Some(9999));
+
+        // legacy entries merge unchanged (forward stays None)
+        let none_ssh = NodeEntry { id: 2, name: "n".into(), public_key: None, address: None, ssh: None };
+        assert_eq!(
+            merge_node_entry(&none_ssh, &mk(plain)).ssh,
+            Some(crate::config::SshDial {
+                host: "10.0.0.9".into(),
+                port: 2222,
+                user: "op".into(),
+                forward_host: None,
+                forward_port: None,
+            })
+        );
     }
 }

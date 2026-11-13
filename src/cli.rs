@@ -204,7 +204,18 @@ pub async fn status(dir: &str) -> Result<()> {
         let naddr = n
             .address
             .clone()
-            .or_else(|| n.ssh.as_ref().map(|s| format!("ssh {}:{}@{}", s.user, s.host, s.port)))
+            .or_else(|| {
+                n.ssh.as_ref().map(|s| {
+                    // M2.8 jump entries append the forward target so the
+                    // operator sees the hop: ssh user@jumper -> target
+                    let jump = match (&s.forward_host, s.forward_port) {
+                        (Some(fh), Some(fp)) => format!(" -> {fh}:{fp}"),
+                        (Some(fh), None) => format!(" -> {fh}"),
+                        _ => String::new(),
+                    };
+                    format!("ssh {}:{}@{}{jump}", s.user, s.host, s.port)
+                })
+            })
             .unwrap_or_else(|| "-".into());
         println!("  {}  {}  {}", n.id, n.name, naddr);
     }

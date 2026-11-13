@@ -81,6 +81,12 @@ pub struct NodeEntry {
 /// SSH dial parameters for the M2.6 fallback tunnel (peer's system sshd,
 /// authenticated with our node key). The tunnel always targets the peer's
 /// own loopback HTTP port, so no http port is needed here.
+///
+/// M2.8 jump: `forward_host`/`forward_port` optionally retarget the
+/// sshd-side `direct-tcpip` channel at a THIRD host — e.g. reach a peer
+/// that is direct-unreachable from us by forwarding through a reachable
+/// jumper's sshd. Both absent = M2.6 behavior bit-for-bit (the sshd's own
+/// `127.0.0.1:<net.listen_port>`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshDial {
@@ -89,6 +95,16 @@ pub struct SshDial {
     pub port: u16,
     #[serde(default = "default_ssh_user")]
     pub user: String,
+    /// M2.8 jump: host the jumper's sshd connects to on our behalf
+    /// (`direct-tcpip` target). Resolved BY the jumper, not by us — may be
+    /// a name only the jumper can resolve. None = the jumper's own
+    /// loopback (M2.6 behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_host: Option<String>,
+    /// M2.8 jump: port on the forward target. None = the peer's
+    /// network-global `net.listen_port` (M2.6 behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_port: Option<u16>,
 }
 
 fn default_ssh_port() -> u16 {
@@ -117,6 +133,26 @@ pub struct EdgeEntry {
 /// Canonical per-node tuple for hashing: (id, name, public_key, address, ssh-dial).
 type NodeCanon<'a> = (u32, &'a str, Option<&'a str>, Option<&'a str>, Option<String>);
 
+/// Render `SshDial` into the hash input string. M2.8: the forward fields
+/// extend the rendering ONLY when set, so every pre-M2.8 config (no forward
+/// fields) keeps the IDENTICAL admin hash — no fleet-wide hash shift. The
+/// extended 5-part form cannot collide with the 3-part form because hosts
+/// and users never contain ':' (same assumption the 3-part form already
+/// makes), and it always carries >= 4 colons.
+fn ssh_dial_hash_string(s: &SshDial) -> String {
+    match (&s.forward_host, s.forward_port) {
+        (None, None) => format!("{}:{}:{}", s.host, s.port, s.user),
+        (fh, fp) => format!(
+            "{}:{}:{}:{}:{}",
+            s.host,
+            s.port,
+            s.user,
+            fh.as_deref().unwrap_or(""),
+            fp.map(|p| p.to_string()).unwrap_or_default()
+        ),
+    }
+}
+
 pub fn admin_hash(revision: u64, nodes: &[NodeEntry], edges: &[EdgeEntry]) -> String {
     let mut nodes_canon: Vec<NodeCanon> = nodes
         .iter()
@@ -126,7 +162,7 @@ pub fn admin_hash(revision: u64, nodes: &[NodeEntry], edges: &[EdgeEntry]) -> St
                 n.name.as_str(),
                 n.public_key.as_deref(),
                 n.address.as_deref(),
-                n.ssh.as_ref().map(|s| format!("{}:{}:{}", s.host, s.port, s.user)),
+                n.ssh.as_ref().map(ssh_dial_hash_string),
             )
         })
         .collect();
@@ -269,7 +305,7 @@ bogus_field = 1
             name: "nat-child".into(),
             public_key: None,
             address: None,
-            ssh: Some(SshDial { host: "203.0.113.5".into(), port: 22, user: "root".into() }),
+            ssh: Some(SshDial { host: "203.0.113.5".into(), port: 22, user: "root".into(), forward_host: None, forward_port: None }),
         });
         let dir = std::env::temp_dir().join("em-m26-config");
         std::fs::create_dir_all(&dir).unwrap();
@@ -278,7 +314,7 @@ bogus_field = 1
         let loaded = NetworkConfig::load(&path).unwrap();
         assert_eq!(
             loaded.nodes[1].ssh,
-            Some(SshDial { host: "203.0.113.5".into(), port: 22, user: "root".into() })
+            Some(SshDial { host: "203.0.113.5".into(), port: 22, user: "root".into(), forward_host: None, forward_port: None })
         );
         // defaults apply when port/user are omitted
         let raw = r#"
@@ -295,7 +331,7 @@ host = "10.0.0.9"
         .unwrap();
         assert_eq!(
             parsed.nodes[0].ssh,
-            Some(SshDial { host: "10.0.0.9".into(), port: 22, user: "root".into() })
+            Some(SshDial { host: "10.0.0.9".into(), port: 22, user: "root".into(), forward_host: None, forward_port: None })
         );
     }
 
@@ -361,15 +397,217 @@ bogus = true
             name: "x".into(),
             public_key: None,
             address: None,
-            ssh: Some(SshDial { host: "10.0.0.9".into(), port: 22, user: "root".into() }),
+            ssh: Some(SshDial { host: "10.0.0.9".into(), port: 22, user: "root".into(), forward_host: None, forward_port: None }),
         });
         a.recompute_hash();
         b.recompute_hash();
         assert_ne!(a.content_hash, b.content_hash);
         // and ssh detail differences matter too
         let mut c = b.clone();
-        c.nodes[1].ssh = Some(SshDial { host: "10.0.0.9".into(), port: 2222, user: "op".into() });
+        c.nodes[1].ssh = Some(SshDial { host: "10.0.0.9".into(), port: 2222, user: "op".into(), forward_host: None, forward_port: None });
         c.recompute_hash();
         assert_ne!(b.content_hash, c.content_hash);
+    }
+
+    // ---------- M2.8: domain addressing ----------
+
+    #[test]
+    fn domain_addresses_roundtrip() {
+        // Domains are legal everywhere an address/host is expected: stored
+        // verbatim, hashed verbatim, resolved at dial time (never here).
+        let raw = r#"
+revision = 4
+content-hash = "abc"
+self_id = 1
+self_name = "a"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+[[nodes]]
+id = 2
+name = "vps6"
+address = "docs.example.internal:8687"
+[nodes.ssh]
+host = "docs.example.internal"
+[[nodes]]
+id = 3
+name = "vps2"
+ssh = { host = "vps2.example.org", port = 22, user = "deploy" }
+"#;
+        let mut cfg: NetworkConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.nodes[0].address.as_deref(), Some("docs.example.internal:8687"));
+        assert_eq!(cfg.nodes[0].ssh.as_ref().unwrap().host, "docs.example.internal");
+        assert_eq!(cfg.nodes[0].ssh.as_ref().unwrap().port, crate::tunnel::DEFAULT_SSH_PORT);
+        let spec = crate::tunnel::TunnelSpec::from_dial(cfg.nodes[0].ssh.as_ref().unwrap(), 8687);
+        assert_eq!(spec.ssh_addr, "docs.example.internal:22");
+
+        // full TOML save/load roundtrip preserves the domain verbatim
+        let dir = std::env::temp_dir().join("em-m28-domain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("network.toml");
+        cfg.save(&p).unwrap();
+        let loaded = NetworkConfig::load(&p).unwrap();
+        assert_eq!(loaded.nodes, cfg.nodes);
+        assert_eq!(loaded.content_hash, cfg.content_hash);
+
+        // swapping domain for IP IS an admin change (hash differs) — while
+        // the DNS record behind the domain rotating is not (string unchanged)
+        let mut other = cfg.clone();
+        other.nodes[0].address = Some("192.0.2.10:8687".into());
+        other.recompute_hash();
+        cfg.recompute_hash();
+        assert_ne!(cfg.content_hash, other.content_hash);
+    }
+
+    // ---------- M2.8: ssh forward-jump fields ----------
+
+    #[test]
+    fn ssh_dial_forward_fields_serde() {
+        // omitted -> None (M2.6 semantics, bit-for-bit)
+        let raw = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+[[nodes]]
+id = 1
+name = "n"
+[nodes.ssh]
+host = "10.0.0.9"
+"#;
+        let parsed: NetworkConfig = toml::from_str(raw).unwrap();
+        let ssh = parsed.nodes[0].ssh.as_ref().unwrap();
+        assert_eq!(ssh.forward_host, None);
+        assert_eq!(ssh.forward_port, None);
+
+        // set -> roundtrip through save/load
+        let mut cfg = parsed.clone();
+        cfg.nodes[0].ssh = Some(SshDial {
+            host: "docs.example.internal".into(),
+            port: 22,
+            user: "deploy".into(),
+            forward_host: Some("vps2.example.org".into()),
+            forward_port: Some(8687),
+        });
+        cfg.recompute_hash();
+        let dir = std::env::temp_dir().join("em-m28-forward");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("network.toml");
+        cfg.save(&p).unwrap();
+        let loaded = NetworkConfig::load(&p).unwrap();
+        assert_eq!(loaded.nodes[0].ssh, cfg.nodes[0].ssh);
+        assert_eq!(loaded.content_hash, cfg.content_hash);
+
+        // None fields are NOT serialized (skip_serializing_if): a
+        // legacy-style file stays byte-identical in spirit — no
+        // "forward_host" keys appear for unset fields
+        let mut legacy = parsed;
+        legacy.recompute_hash();
+        legacy.save(&p).unwrap();
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("forward"));
+
+        // unknown fields (typos like forwardhost) still hard-fail
+        let raw_typo = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+[[nodes]]
+id = 1
+name = "n"
+[nodes.ssh]
+host = "10.0.0.9"
+forwardhost = "x"
+"#;
+        assert!(toml::from_str::<NetworkConfig>(raw_typo).is_err());
+    }
+
+    #[test]
+    fn admin_hash_unchanged_for_legacy_configs_and_shifted_for_jump() {
+        // Golden captured from the PRE-M2.8 binary (ea3f393) for exactly
+        // this config: proves adding the forward fields did not shift the
+        // hash of any existing (forward-less) config.
+        const M26_GOLDEN: &str = "62257f57c1745661234e65fe";
+        let raw = r#"
+revision = 4
+content-hash = "ignored"
+self_id = 1
+self_name = "node-1"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+[[nodes]]
+id = 1
+name = "node-1"
+[[nodes]]
+id = 2
+name = "nat-child"
+[nodes.ssh]
+host = "203.0.113.5"
+port = 2222
+user = "op"
+[[nodes]]
+id = 3
+name = "direct"
+address = "docs.example.internal:8687"
+[[edges]]
+a = 1
+b = 2
+"#;
+        let mut cfg: NetworkConfig = toml::from_str(raw).unwrap();
+        cfg.recompute_hash();
+        assert_eq!(cfg.content_hash, M26_GOLDEN);
+
+        // loaded + re-saved (roundtrip) keeps the same hash
+        let dir = std::env::temp_dir().join("em-m28-golden");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("network.toml");
+        cfg.save(&p).unwrap();
+        let mut reloaded = NetworkConfig::load(&p).unwrap();
+        reloaded.recompute_hash();
+        assert_eq!(reloaded.content_hash, M26_GOLDEN);
+
+        // struct-built entry with explicit forward None -> same tuple
+        let mut by_struct = cfg.clone();
+        by_struct.nodes[1].ssh = Some(SshDial {
+            host: "203.0.113.5".into(),
+            port: 2222,
+            user: "op".into(),
+            forward_host: None,
+            forward_port: None,
+        });
+        by_struct.recompute_hash();
+        assert_eq!(by_struct.content_hash, M26_GOLDEN);
+
+        // declaring a jump IS an admin change: every forward variation
+        // shifts the hash away from the golden (and from each other)
+        let mut jumped = cfg.clone();
+        let base = cfg.nodes[1].ssh.clone().unwrap();
+        jumped.nodes[1].ssh = Some(SshDial {
+            forward_host: Some("vps2.example.org".into()),
+            forward_port: Some(8687),
+            ..base.clone()
+        });
+        jumped.recompute_hash();
+        assert_ne!(jumped.content_hash, M26_GOLDEN);
+        let mut host_only = cfg.clone();
+        host_only.nodes[1].ssh = Some(SshDial { forward_host: Some("vps2.example.org".into()), ..base.clone() });
+        host_only.recompute_hash();
+        let mut port_only = cfg;
+        port_only.nodes[1].ssh = Some(SshDial { forward_port: Some(8687), ..base });
+        port_only.recompute_hash();
+        assert_ne!(host_only.content_hash, M26_GOLDEN);
+        assert_ne!(port_only.content_hash, M26_GOLDEN);
+        assert_ne!(host_only.content_hash, port_only.content_hash);
     }
 }

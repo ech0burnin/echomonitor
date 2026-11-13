@@ -15,6 +15,10 @@ echomonitor is a lightweight, self-hosted monitoring system for small fleets of 
 - **Alert channels**: ntfy (critical only), Telegram and Matrix (full monitoring) — with channel diversification across nodes and automatic bot migration if a channel becomes unreachable.
 - **Passbot**: scheduled delivery of KeePass databases via Telegram/Matrix.
 
+## Addressing
+
+Node `address` and `ssh.host` accept **domains as well as IPs** (`host:port`; IPv6 literals need `[::1]:8687` brackets). Domains are the canonical way to address a node — fleet IPs drift, DNS does not. Names are resolved at dial time, and the SSH TOFU pin is keyed on the configured `host:port` string, so a domain-keyed pin survives IP rotation.
+
 ## Status
 
 **Work in progress.** Architecture settled, implementation ongoing.
