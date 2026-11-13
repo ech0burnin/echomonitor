@@ -18,21 +18,33 @@ use crate::config::{EdgeEntry, NodeEntry};
 use std::collections::HashMap;
 
 /// A node is dead once its last successful gossip is older than this.
-/// 3 × default gossip interval (15s); margins dwarf typical NTP skew.
+/// Historical default: 3 × default gossip interval (15s); margins dwarf
+/// typical NTP skew. Callers with a non-default interval should use
+/// [`t_dead_for`] instead so the "3 missed rounds" ratio is preserved.
 pub const T_DEAD_MS: u64 = 45_000;
 /// A desired-parent change must hold this many consecutive rounds before
-/// the node switches (flap guard). Worst-case failover ≈ T_DEAD + 2 rounds.
+/// the node switches (flap guard). Worst-case failover ≈ dead threshold
+/// + 2 rounds.
 pub const ELECT_STABILITY: u32 = 2;
+
+/// Dead threshold scaled to the configured gossip interval: a node counts
+/// as dead after 3 missed rounds, whatever the round cadence is. The
+/// default (15s) yields exactly [`T_DEAD_MS`]; a test mesh with a 2s
+/// interval fails over after 6s instead of 45s while running the same
+/// production code path.
+pub fn t_dead_for(gossip_interval_secs: u64) -> u64 {
+    gossip_interval_secs.max(1).saturating_mul(3_000)
+}
 
 /// id -> unix ms of the last successful direct gossip with that node
 /// (self seeded at boot). Runtime-only, replicated via `GossipMessage::seen`.
 pub type Evidence = HashMap<u32, u64>;
 
 /// Set of node ids with fresh evidence (self always alive).
-pub fn alive_set(evidence: &Evidence, now_ms: u64) -> Vec<u32> {
+pub fn alive_set(evidence: &Evidence, now_ms: u64, t_dead_ms: u64) -> Vec<u32> {
     let mut v: Vec<u32> = evidence
         .iter()
-        .filter(|(_, &at)| now_ms.saturating_sub(at) < T_DEAD_MS)
+        .filter(|(_, &at)| now_ms.saturating_sub(at) < t_dead_ms)
         .map(|(&id, _)| id)
         .collect();
     v.sort_unstable();
@@ -54,13 +66,15 @@ fn alive_neighbors(node: u32, edges: &[EdgeEntry], alive: &[u32]) -> usize {
 /// alive set is large enough) have at least two alive neighbors.
 /// Self is expected to be present in `evidence` (seeded at boot); callers
 /// pass the full replicated state so every node computes the same result.
+/// `t_dead_ms` is the dead threshold (see [`t_dead_for`]).
 pub fn elect(
     nodes: &[NodeEntry],
     edges: &[EdgeEntry],
     evidence: &Evidence,
     now_ms: u64,
+    t_dead_ms: u64,
 ) -> Option<u32> {
-    let alive = alive_set(evidence, now_ms);
+    let alive = alive_set(evidence, now_ms, t_dead_ms);
     if alive.is_empty() {
         return None;
     }
@@ -154,7 +168,7 @@ mod tests {
         let n = nodes(&[1, 2]);
         let e = vec![edge(1, 2)];
         let ev = evidence(&[(1, 0), (2, 0)], NOW);
-        assert_eq!(elect(&n, &e, &ev, NOW), Some(1));
+        assert_eq!(elect(&n, &e, &ev, NOW, T_DEAD_MS), Some(1));
     }
 
     #[test]
@@ -163,7 +177,7 @@ mod tests {
         let n = nodes(&[1, 2, 3]);
         let e = vec![edge(1, 2), edge(2, 3)];
         let ev = evidence(&[(1, 0), (2, 0), (3, 0)], NOW);
-        assert_eq!(elect(&n, &e, &ev, NOW), Some(2));
+        assert_eq!(elect(&n, &e, &ev, NOW, T_DEAD_MS), Some(2));
     }
 
     #[test]
@@ -172,7 +186,7 @@ mod tests {
         let n = nodes(&[1, 2, 3]);
         let e = vec![edge(1, 2), edge(1, 3)];
         let ev = evidence(&[(1, 0), (2, 0), (3, 0)], NOW);
-        assert_eq!(elect(&n, &e, &ev, NOW), Some(1));
+        assert_eq!(elect(&n, &e, &ev, NOW, T_DEAD_MS), Some(1));
     }
 
     #[test]
@@ -181,7 +195,7 @@ mod tests {
         let e = vec![edge(1, 2), edge(2, 3)];
         // node 1 evidence stale past T_DEAD
         let ev = evidence(&[(1, T_DEAD_MS), (2, 0), (3, 0)], NOW);
-        assert_eq!(elect(&n, &e, &ev, NOW), Some(2));
+        assert_eq!(elect(&n, &e, &ev, NOW, T_DEAD_MS), Some(2));
     }
 
     #[test]
@@ -189,9 +203,9 @@ mod tests {
         let n = nodes(&[1, 2]);
         let e = vec![edge(1, 2)];
         let ev_dead = evidence(&[(1, T_DEAD_MS), (2, 0)], NOW);
-        assert_eq!(elect(&n, &e, &ev_dead, NOW), Some(2));
+        assert_eq!(elect(&n, &e, &ev_dead, NOW, T_DEAD_MS), Some(2));
         let ev_alive = evidence(&[(1, T_DEAD_MS - 1), (2, 0)], NOW);
-        assert_eq!(elect(&n, &e, &ev_alive, NOW), Some(1));
+        assert_eq!(elect(&n, &e, &ev_alive, NOW, T_DEAD_MS), Some(1));
     }
 
     #[test]
@@ -201,14 +215,14 @@ mod tests {
         let n = nodes(&[1, 2, 3, 4, 5]);
         let e = vec![edge(1, 2), edge(2, 3), edge(3, 4), edge(4, 5)];
         let ev = evidence(&[(1, 0), (5, 0)], NOW);
-        assert_eq!(elect(&n, &e, &ev, NOW), Some(1));
+        assert_eq!(elect(&n, &e, &ev, NOW, T_DEAD_MS), Some(1));
     }
 
     #[test]
     fn empty_evidence_no_parent() {
         let n = nodes(&[1, 2]);
         let ev = Evidence::new();
-        assert_eq!(elect(&n, &[], &ev, NOW), None);
+        assert_eq!(elect(&n, &[], &ev, NOW, T_DEAD_MS), None);
     }
 
     #[test]
@@ -224,5 +238,35 @@ mod tests {
         // flap back to 1 for a single round keeps 2
         assert_eq!(g.observe(Some(1)), (Some(2), false));
         assert_eq!(g.observe(Some(1)), (Some(1), true));
+    }
+
+    #[test]
+    fn t_dead_for_default_matches_the_historical_constant() {
+        // prod default (15s) keeps the pre-M2.7 45s threshold bit-for-bit
+        assert_eq!(t_dead_for(15), T_DEAD_MS);
+        assert_eq!(t_dead_for(15), 45_000);
+    }
+
+    #[test]
+    fn t_dead_for_scales_with_interval_and_floors_zero() {
+        // 3 missed rounds at any cadence; nonsense intervals stay sane
+        assert_eq!(t_dead_for(2), 6_000);
+        assert_eq!(t_dead_for(60), 180_000);
+        assert_eq!(t_dead_for(0), 3_000);
+    }
+
+    #[test]
+    fn short_dead_threshold_re_elects_faster() {
+        // the property M2.7 relies on: with a 2s test interval the same
+        // evidence that stays fresh for 45s in prod flips in 6s — star
+        // around node-1, node-1's evidence 10s old
+        let n = nodes(&[1, 2, 3]);
+        let e = vec![edge(1, 2), edge(1, 3)];
+        let ev = evidence(&[(1, 10_000), (2, 0), (3, 0)], NOW);
+        // prod threshold: 10s is fresh, hub node-1 (two neighbors) wins
+        assert_eq!(elect(&n, &e, &ev, NOW, t_dead_for(15)), Some(1));
+        // 2s-interval threshold: node-1 is dead, survivors {2,3} waive
+        // the two-neighbor rule -> lowest alive id
+        assert_eq!(elect(&n, &e, &ev, NOW, t_dead_for(2)), Some(2));
     }
 }

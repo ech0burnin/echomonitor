@@ -7,7 +7,6 @@ use crate::routing;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub fn init(dir: &str) -> Result<()> {
     let dir_path = Path::new(dir);
@@ -74,44 +73,10 @@ pub async fn run(dir: &str) -> Result<()> {
     }
 
     // gossip loop: every interval, push our snapshot to all reachable peers,
-    // merge their replies, record RTT latencies
-    let secret: Arc<str> = cfg.auth.network_secret.as_str().into();
-    let self_id = cfg.self_id;
-    let interval = cfg.net.gossip_interval_secs.max(1);
-    let loop_state = state.clone();
-    tokio::spawn(async move {
-        let client = NodeClient::new(secret, self_id);
-        let mut tick = tokio::time::interval(Duration::from_secs(interval));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // M2.5: deterministic parent election after each round; act on a
-        // change only once the desired parent held for ELECT_STABILITY rounds.
-        let mut gate = crate::elector::StabilityGate::new();
-        loop {
-            tick.tick().await;
-            let results = transport::gossip_round(&loop_state, &client).await;
-            let ok = results.iter().filter(|(_, l)| l.is_some()).count();
-            tracing::debug!(peers = results.len(), ok, "gossip round done");
-            let now_ms = crate::checks::chrono_pseudo::Ts::now().unix_ms();
-            let desired = {
-                let g = loop_state.cfg.read().unwrap();
-                let evidence = loop_state.evidence.read().unwrap();
-                crate::elector::elect(&g.nodes, &g.edges, &evidence, now_ms)
-            };
-            let (effective, changed) = gate.observe(desired);
-            *loop_state.parent.write().unwrap() = effective;
-            if changed {
-                match (effective, self_id) {
-                    (Some(p), _) if p == self_id => {
-                        tracing::info!(parent = p, "PARENT role acquired");
-                    }
-                    (Some(p), _) => {
-                        tracing::info!(parent = p, "parent changed");
-                    }
-                    (None, _) => tracing::warn!("no parent eligible"),
-                }
-            }
-        }
-    });
+    // merge their replies, record RTT latencies; deterministic parent
+    // election runs after each round (M2.7: the loop lives in
+    // transport::spawn_gossip_loop so integration tests drive the same code)
+    transport::spawn_gossip_loop(state.clone());
 
     // M3.1 wiring: scheduled HTTP checks from [[checks]] config.
     // M3.3: EVERY node runs all configured checks locally (config is

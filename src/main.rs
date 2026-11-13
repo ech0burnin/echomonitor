@@ -1,17 +1,5 @@
 use clap::{Parser, Subcommand};
 
-mod checks;
-mod cli;
-mod config;
-mod crypto;
-mod elector;
-mod logging;
-mod routing;
-mod selfstats;
-mod sitereport;
-mod transport;
-mod tunnel;
-
 #[derive(Parser)]
 #[command(
     name = "echomonitor",
@@ -59,13 +47,13 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { dir } => cli::init(&dir),
-        Commands::Run { dir } => cli::run(&dir).await,
-        Commands::Keygen => cli::keygen(),
+        Commands::Init { dir } => echomonitor::cli::init(&dir),
+        Commands::Run { dir } => echomonitor::cli::run(&dir).await,
+        Commands::Keygen => echomonitor::cli::keygen(),
         Commands::Deploy { .. } => {
             println!("deploy: not implemented yet (planned for M5)");
             Ok(())
         }
-        Commands::Status { dir } => cli::status(&dir).await,
+        Commands::Status { dir } => echomonitor::cli::status(&dir).await,
     }
 }

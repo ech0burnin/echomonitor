@@ -472,6 +472,61 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
     out
 }
 
+/// The daemon's gossip + election loop (M2.7: extracted from `cli::run`
+/// so the integration test drives the exact production code path).
+/// Every `net.gossip_interval_secs` it push-pulls a snapshot with all
+/// reachable peers, then recomputes the deterministic parent; a desired
+/// change is acted on only after it held for `ELECT_STABILITY`
+/// consecutive rounds (flap guard). The dead threshold scales with the
+/// interval (`elector::t_dead_for`) so a fast test mesh behaves like a
+/// slow production one. Aborting the returned task stops the node's
+/// gossiping — peers notice through the evidence table.
+pub fn spawn_gossip_loop(state: Arc<NodeState>) -> tokio::task::JoinHandle<()> {
+    let (interval, self_id, secret) = {
+        let g = state.cfg.read().unwrap();
+        (
+            g.net.gossip_interval_secs.max(1),
+            g.self_id,
+            g.auth.network_secret.clone(),
+        )
+    };
+    let t_dead_ms = crate::elector::t_dead_for(interval);
+    tokio::spawn(async move {
+        let secret: Arc<str> = secret.as_str().into();
+        let client = NodeClient::new(secret, self_id);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // M2.5: deterministic parent election after each round; act on a
+        // change only once the desired parent held for ELECT_STABILITY rounds.
+        let mut gate = crate::elector::StabilityGate::new();
+        loop {
+            tick.tick().await;
+            let results = gossip_round(&state, &client).await;
+            let ok = results.iter().filter(|(_, l)| l.is_some()).count();
+            tracing::debug!(peers = results.len(), ok, "gossip round done");
+            let now_ms = crate::checks::chrono_pseudo::Ts::now().unix_ms();
+            let desired = {
+                let g = state.cfg.read().unwrap();
+                let evidence = state.evidence.read().unwrap();
+                crate::elector::elect(&g.nodes, &g.edges, &evidence, now_ms, t_dead_ms)
+            };
+            let (effective, changed) = gate.observe(desired);
+            *state.parent.write().unwrap() = effective;
+            if changed {
+                match effective {
+                    Some(p) if p == self_id => {
+                        tracing::info!(parent = p, "PARENT role acquired");
+                    }
+                    Some(p) => {
+                        tracing::info!(parent = p, "parent changed");
+                    }
+                    None => tracing::warn!("no parent eligible"),
+                }
+            }
+        }
+    })
+}
+
 /// Ask the node's TunnelManager for a local endpoint towards the peer,
 /// building/rebuilding the tunnel when needed. `peer_http_port` is the
 /// network-global `net.listen_port` — the DEFAULT forward target port,
@@ -1241,7 +1296,7 @@ mod tests {
             let g = state.cfg.read().unwrap();
             let ev = state.evidence.read().unwrap();
             assert_eq!(
-                crate::elector::elect(&g.nodes, &g.edges, &ev, now),
+                crate::elector::elect(&g.nodes, &g.edges, &ev, now, crate::elector::T_DEAD_MS),
                 Some(1),
                 "both nodes must elect node-1 (lowest id, rule waived at N=2)"
             );
@@ -1283,7 +1338,7 @@ mod tests {
         for s in [&s2, &s3] {
             let g = s.cfg.read().unwrap();
             let ev = s.evidence.read().unwrap();
-            assert_eq!(crate::elector::elect(&g.nodes, &g.edges, &ev, now), Some(1));
+            assert_eq!(crate::elector::elect(&g.nodes, &g.edges, &ev, now, crate::elector::T_DEAD_MS), Some(1));
         }
 
         // node-1 dies: its evidence goes stale on the survivors
@@ -1295,7 +1350,7 @@ mod tests {
             let g = s.cfg.read().unwrap();
             let ev = s.evidence.read().unwrap();
             assert_eq!(
-                crate::elector::elect(&g.nodes, &g.edges, &ev, now),
+                crate::elector::elect(&g.nodes, &g.edges, &ev, now, crate::elector::T_DEAD_MS),
                 Some(2),
                 "survivors must re-elect: strict rule finds no candidate (no 2-3 edge), degraded fallback to lowest alive"
             );
