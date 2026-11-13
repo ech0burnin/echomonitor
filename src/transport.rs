@@ -8,12 +8,18 @@
 //! M2.4: conflict-resolve by revision + admin hash. Admin content = revision +
 //! nodes + edges (latency-free, order-independent). Forks at the same revision
 //! converge deterministically to the larger admin hash. Merges persist to disk.
+//!
+//! M3.3: gossip messages also carry site probe results (runtime-only state,
+//! never persisted, never hashed). Probe merge is a commutative union with
+//! last-write-wins per (check_id, node_id) — see merge_probes.
 
 // Items wired for later milestones (M2.5 elections read VerifiedNode) are exercised by tests only.
 #![allow(dead_code)]
 
+use crate::checks::SiteProbe;
 use crate::config::{admin_hash, EdgeEntry, NetworkConfig, NodeEntry};
 use crate::crypto;
+use crate::sitereport::ProbeTable;
 use axum::{
     extract::{Request, State},
     http::StatusCode,
@@ -24,6 +30,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -36,6 +43,9 @@ pub struct NodeState {
     pub cfg: Arc<RwLock<NetworkConfig>>,
     /// Where merged configs are persisted (network.toml); None in tests.
     pub persist_path: Option<std::path::PathBuf>,
+    /// M3.3: gossip-shared site probe results, latest per (check_id, node_id).
+    /// Runtime-only state: never persisted, never part of admin_hash.
+    pub probes: Arc<RwLock<ProbeTable>>,
 }
 
 impl NodeState {
@@ -43,6 +53,7 @@ impl NodeState {
         Self {
             cfg: Arc::new(RwLock::new(cfg)),
             persist_path: None,
+            probes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -50,7 +61,14 @@ impl NodeState {
         Self {
             cfg: Arc::new(RwLock::new(cfg)),
             persist_path: Some(path),
+            probes: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Record one of OUR OWN probe results (from the check engine sink).
+    pub fn record_own_probe(&self, probe: SiteProbe) {
+        let mut t = self.probes.write().unwrap();
+        t.insert((probe.check_id.clone(), probe.node_id), probe);
     }
 
     /// Atomically persist the current config view (tmp file + rename).
@@ -71,13 +89,17 @@ impl NodeState {
     }
 
     /// Point-in-time copy of our topology for gossip/state replies.
+    /// Includes the full probe table (ours + everything learned from peers),
+    /// so results propagate transitively through the mesh.
     pub fn snapshot_msg(&self) -> GossipMessage {
         let g = self.cfg.read().unwrap();
+        let probes: Vec<SiteProbe> = self.probes.read().unwrap().values().cloned().collect();
         GossipMessage {
             from: g.self_id,
             revision: g.revision,
             nodes: g.nodes.clone(),
             edges: g.edges.clone(),
+            probes,
         }
     }
 }
@@ -90,6 +112,37 @@ pub struct GossipMessage {
     pub revision: u64,
     pub nodes: Vec<NodeEntry>,
     pub edges: Vec<EdgeEntry>,
+    /// Site probe results shared M3.3-style. `serde(default)` keeps messages
+    /// from older binaries (no probes field) deserializable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<SiteProbe>,
+}
+
+// ---------- probe merge ----------
+
+/// Merge incoming probe results into the shared table: union of keys,
+/// latest `measured_at` wins per (check_id, node_id). On an exact timestamp
+/// tie the lexicographically larger serialized probe wins, making the merge
+/// fully commutative and associative (both sides of an exchange converge to
+/// the identical table in one round, like the M2.4 union merge).
+pub fn merge_probes(table: &RwLock<ProbeTable>, incoming: &[SiteProbe]) {
+    let mut t = table.write().unwrap();
+    for p in incoming {
+        match t.get(&(p.check_id.clone(), p.node_id)) {
+            None => {
+                t.insert((p.check_id.clone(), p.node_id), p.clone());
+            }
+            Some(cur) => {
+                let newer = p.measured_at.unix_ms() > cur.measured_at.unix_ms();
+                let tie_break = p.measured_at.unix_ms() == cur.measured_at.unix_ms()
+                    && serde_json::to_string(p).unwrap_or_default()
+                        > serde_json::to_string(cur).unwrap_or_default();
+                if newer || tie_break {
+                    t.insert((p.check_id.clone(), p.node_id), p.clone());
+                }
+            }
+        }
+    }
 }
 
 // ---------- merge logic ----------
@@ -255,6 +308,7 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
             Ok(reply) => {
                 let ms = t0.elapsed().as_millis() as u64;
                 merge_into(&state.cfg, &reply);
+                merge_probes(&state.probes, &reply.probes);
                 set_edge_latency(&state.cfg, self_id, peer_id, ms);
                 tracing::debug!(peer = peer_id, latency_ms = ms, "gossip ok");
                 out.push((peer_id, Some(ms)));
@@ -306,13 +360,15 @@ async fn health(State(state): State<Arc<NodeState>>) -> Json<serde_json::Value> 
     }))
 }
 
-/// Inbound topology gossip: merge the peer's view, persist, reply with our
-/// own snapshot (push-pull in a single round trip).
+/// Inbound topology gossip: merge the peer's view (config + probe results),
+/// persist the config, reply with our own snapshot (push-pull in a single
+/// round trip). Probe results are runtime state — merged but NOT persisted.
 async fn gossip(
     State(state): State<Arc<NodeState>>,
     Json(msg): Json<GossipMessage>,
 ) -> Json<GossipMessage> {
     merge_into(&state.cfg, &msg);
+    merge_probes(&state.probes, &msg.probes);
     state.persist();
     Json(state.snapshot_msg())
 }
@@ -432,6 +488,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()) },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(7) }],
+            probes: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -452,6 +509,7 @@ mod tests {
             revision: 2,
             nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None }],
             edges: vec![],
+            probes: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -474,6 +532,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
             ],
             edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
+            probes: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -500,6 +559,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
+            probes: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -529,11 +589,11 @@ mod tests {
         let msg_a_to_b = shared_a.read().unwrap().clone();
         merge_into(
             &shared_a,
-            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone() },
+            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![] },
         );
         merge_into(
             &shared_b,
-            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone() },
+            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![] },
         );
 
         let ga = shared_a.read().unwrap();
@@ -567,6 +627,7 @@ mod tests {
                 revision: 3,
                 nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None }],
                 edges: vec![],
+            probes: vec![],
             },
         );
         state.persist();
@@ -607,6 +668,7 @@ mod tests {
             revision: 1,
             nodes: vec![],
             edges: vec![],
+            probes: vec![],
         };
         let reply = nc.gossip(&format!("127.0.0.1:{port}"), &msg).await.unwrap();
         assert_eq!(reply.from, 1);
@@ -700,6 +762,154 @@ mod tests {
             let g = state_b.cfg.read().unwrap();
             assert_eq!(g.nodes.len(), 2);
             assert!(g.edges.iter().any(|e| e.a == 1 && e.b == 2 && e.latency_ms.is_some()));
+        }
+    }
+
+    // ---------- M3.3 probe sharing ----------
+
+    use crate::checks::{chrono_pseudo::Ts, CheckOutcome, SiteProbe};
+
+    fn probe(check: &str, node: u32, at_ms: u64, outcome: CheckOutcome) -> SiteProbe {
+        SiteProbe { check_id: check.into(), node_id: node, measured_at: Ts(at_ms), outcome, status: None, ip: None }
+    }
+
+    fn table_of(list: &[SiteProbe]) -> RwLock<ProbeTable> {
+        let mut t = ProbeTable::new();
+        for p in list {
+            t.insert((p.check_id.clone(), p.node_id), p.clone());
+        }
+        RwLock::new(t)
+    }
+
+    fn sorted_table(t: &RwLock<ProbeTable>) -> Vec<SiteProbe> {
+        let mut v: Vec<SiteProbe> = t.read().unwrap().values().cloned().collect();
+        v.sort_by_key(|p| (p.check_id.clone(), p.node_id));
+        v
+    }
+
+    #[test]
+    fn probe_merge_is_commutative_and_latest_wins() {
+        let a = vec![
+            probe("c1", 1, 1_000, CheckOutcome::Ok { latency_ms: 10 }),
+            probe("c1", 2, 900, CheckOutcome::Ok { latency_ms: 20 }),
+            probe("c2", 1, 800, CheckOutcome::Fail { reason: "old".into() }),
+        ];
+        let b = vec![
+            probe("c1", 1, 1_500, CheckOutcome::Ok { latency_ms: 11 }), // newer: must win
+            probe("c1", 3, 1_200, CheckOutcome::Ok { latency_ms: 30 }), // new key: union
+            probe("c2", 1, 900, CheckOutcome::Ok { latency_ms: 40 }),   // newer: outcome flips
+        ];
+        let ta = table_of(&a);
+        let tb = table_of(&b);
+        merge_probes(&ta, &b);
+        merge_probes(&tb, &a);
+
+        let (va, vb) = (sorted_table(&ta), sorted_table(&tb));
+        assert_eq!(va, vb, "merge must be commutative: both sides identical after one exchange");
+        assert_eq!(va.len(), 4, "union of keys: c1/1, c1/2, c1/3, c2/1");
+        let t = ta.read().unwrap();
+        assert_eq!(
+            t.get(&("c1".into(), 1)).unwrap().measured_at.unix_ms(),
+            1_500,
+            "latest measured_at wins"
+        );
+        assert_eq!(
+            t.get(&("c2".into(), 1)).unwrap().outcome,
+            CheckOutcome::Ok { latency_ms: 40 },
+            "newer result replaces older even across outcome classes"
+        );
+    }
+
+    #[test]
+    fn probe_merge_tie_breaks_deterministically() {
+        // same key, same timestamp, different content: the larger serialized
+        // probe wins on BOTH sides — commutativity must not depend on order
+        let x = probe("c", 1, 5_000, CheckOutcome::Fail { reason: "aaa".into() });
+        let y = probe("c", 1, 5_000, CheckOutcome::Fail { reason: "zzz".into() });
+        let ta = table_of(std::slice::from_ref(&x));
+        let tb = table_of(std::slice::from_ref(&y));
+        merge_probes(&ta, &[y]);
+        merge_probes(&tb, &[x]);
+        assert_eq!(sorted_table(&ta), sorted_table(&tb), "tie must resolve identically on both sides");
+    }
+
+    #[test]
+    fn gossip_message_without_probes_still_parses() {
+        // wire format from a pre-M3.3 binary
+        let raw = r#"{"from":2,"revision":3,"nodes":[],"edges":[]}"#;
+        let msg: GossipMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.from, 2);
+        assert!(msg.probes.is_empty());
+    }
+
+    #[test]
+    fn probe_results_not_persisted_into_config() {
+        let dir = std::env::temp_dir().join("em-m33-nopersist");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let state = NodeState::with_persist(
+            NetworkConfig::bootstrap("s".into(), "n1".into()),
+            path.clone(),
+        );
+        state.record_own_probe(probe("web", 1, 42, CheckOutcome::Ok { latency_ms: 5 }));
+        state.persist();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("probe"), "probe data must not leak into network.toml");
+        let loaded = NetworkConfig::load(&path).unwrap();
+        let before = loaded.content_hash.clone();
+        // a gossip carrying probes must not change the persisted admin hash
+        merge_probes(&state.probes, &[probe("web", 2, 50, CheckOutcome::Ok { latency_ms: 7 })]);
+        state.persist();
+        let after = NetworkConfig::load(&path).unwrap().content_hash;
+        assert_eq!(before, after, "admin_hash must be unaffected by probe data");
+    }
+
+    #[tokio::test]
+    async fn probes_converge_in_one_exchange_round() {
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        let mut cfg_b = NetworkConfig::bootstrap("test-secret".into(), "node-2".into());
+        cfg_b.self_id = 2;
+        cfg_b.nodes[0].id = 2;
+        cfg_a.recompute_hash();
+        cfg_b.recompute_hash();
+
+        let state_a = Arc::new(NodeState::new(cfg_a));
+        let state_b = Arc::new(NodeState::new(cfg_b));
+
+        // each side has ONLY its own probe result
+        state_a.record_own_probe(probe("web", 1, 1_000, CheckOutcome::Ok { latency_ms: 10 }));
+        state_b.record_own_probe(probe("web", 2, 1_000, CheckOutcome::Fail { reason: "conn refused".into() }));
+
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_b = lb.local_addr().unwrap().port();
+        let sb = state_b.clone();
+        tokio::spawn(async move { axum::serve(lb, router(sb)).await.unwrap() });
+
+        {
+            let mut g = state_a.cfg.write().unwrap();
+            g.nodes.push(NodeEntry {
+                id: 2,
+                name: "node-2".into(),
+                public_key: None,
+                address: Some(format!("127.0.0.1:{port_b}")),
+            });
+            g.recompute_hash();
+        }
+
+        // ONE round: A pushes (B merges A's probes), B replies (A merges B's)
+        let client_a = NodeClient::new("test-secret".into(), 1);
+        let res = gossip_round(&state_a, &client_a).await;
+        assert_eq!(res.len(), 1);
+        assert!(res[0].1.is_some(), "gossip must succeed");
+
+        for (state, label) in [(&state_a, "A"), (&state_b, "B")] {
+            let t = state.probes.read().unwrap();
+            assert_eq!(t.len(), 2, "{label} must hold both nodes' results after one round");
+            assert!(t.contains_key(&("web".into(), 1)), "{label} missing node-1 result");
+            assert!(t.contains_key(&("web".into(), 2)), "{label} missing node-2 result");
         }
     }
 }

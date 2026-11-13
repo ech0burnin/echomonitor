@@ -7,6 +7,7 @@ mod crypto;
 mod logging;
 mod routing;
 mod selfstats;
+mod sitereport;
 mod transport;
 
 #[derive(Parser)]

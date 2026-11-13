@@ -66,12 +66,29 @@ pub async fn run(dir: &str) -> Result<()> {
     });
 
     // M3.1 wiring: scheduled HTTP checks from [[checks]] config.
-    // Empty list = no check tasks spawned, engine off.
+    // M3.3: EVERY node runs all configured checks locally (config is
+    // replicated); finished records feed the gossip-shared probe table.
     if !cfg.checks.is_empty() {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let engine = std::sync::Arc::new(crate::checks::Engine::new(10, 3));
         let specs = cfg.checks.clone();
         tracing::info!(count = specs.len(), "check engine starting");
+
+        let sink_state = state.clone();
+        let sink_node = cfg.self_id;
+        let engine = crate::checks::Engine::new(10, 3).with_sink(std::sync::Arc::new(
+            move |rec: &crate::checks::CheckRecord| {
+                sink_state.record_own_probe(crate::checks::SiteProbe {
+                    check_id: rec.check.clone(),
+                    node_id: sink_node,
+                    measured_at: rec.at,
+                    outcome: rec.outcome.clone(),
+                    status: rec.status,
+                    ip: rec.ip.clone(),
+                });
+            },
+        ));
+        let engine = std::sync::Arc::new(engine);
+
         tokio::spawn(async move {
             engine.run(specs, shutdown_rx).await;
         });
@@ -106,6 +123,7 @@ pub async fn status(dir: &str) -> Result<()> {
                 revision: cfg.revision,
                 nodes: cfg.nodes.clone(),
                 edges: cfg.edges.clone(),
+                probes: Vec::new(),
             },
             false,
         ),
@@ -166,6 +184,24 @@ pub async fn status(dir: &str) -> Result<()> {
             let r = table.route(t).unwrap();
             let path: Vec<String> = r.path.iter().map(|x| x.to_string()).collect();
             println!("  → {}  via {}  {} ms  [{}]", t, r.next_hop, r.cost_ms, path.join("→"));
+        }
+    }
+    println!();
+    // M3.3: consolidated site report from the gossip-shared probe table
+    println!("sites:");
+    if cfg.checks.is_empty() {
+        println!("  (none configured)");
+    } else {
+        let mut probes: crate::sitereport::ProbeTable = crate::sitereport::ProbeTable::new();
+        for p in &msg.probes {
+            probes.insert((p.check_id.clone(), p.node_id), p.clone());
+        }
+        let lines = crate::sitereport::report_now(&cfg.checks, &msg.nodes, &probes);
+        for l in lines {
+            println!("{l}");
+        }
+        if !live {
+            println!("  (daemon offline — no probe data can flow)");
         }
     }
     Ok(())

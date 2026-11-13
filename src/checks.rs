@@ -4,9 +4,13 @@
 //! in-memory ring plus an append-only JSONL history. Consecutive failures
 //! feed the flap counter (alerting itself arrives with M4 channels; the
 //! engine logs warn lines so nothing is lost until then).
+//!
+//! M3.3: every node runs all configured checks locally (the config is
+//! replicated). Finished records are tapped through `probe_sink` into the
+//! node's shared probe table, from where they travel via gossip
+//! (see transport::NodeState and sitereport).
 
 #![allow(dead_code)]
-// Wired into the daemon in M3.2+ (scheduler + CLI surface); exercised by tests only for now.
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -54,6 +58,39 @@ pub struct CheckRecord {
     pub check: String,
     pub at: chrono_pseudo::Ts,
     pub outcome: CheckOutcome,
+    /// Observed HTTP status code (None when the request never completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Remote address the probe actually hit (None on network errors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+}
+
+impl CheckRecord {
+    /// Record with no status/ip metadata (test/helper convenience).
+    pub fn bare(check: &str, at: chrono_pseudo::Ts, outcome: CheckOutcome) -> Self {
+        Self { check: check.into(), at, outcome, status: None, ip: None }
+    }
+}
+
+/// A check result as shared through gossip: WHO measured WHAT and WHEN.
+/// Runtime-only state — never persisted into network.toml, never part of
+/// admin_hash. Keyed by (check_id, node_id) in the shared table, merged
+/// last-write-wins on `measured_at` (see transport::merge_probes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SiteProbe {
+    /// Check name from HttpCheckSpec (unique within the config).
+    pub check_id: String,
+    /// Numeric id of the node that ran the probe.
+    pub node_id: u32,
+    pub measured_at: chrono_pseudo::Ts,
+    pub outcome: CheckOutcome,
+    /// Observed HTTP status code (None when the request never completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Remote address observed by the probing node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
 }
 
 /// Timestamp without pulling chrono in: unix millis in a newtype that
@@ -129,10 +166,17 @@ impl History {
 
 // ---------- engine ----------
 
+/// Callback type for tapping finished check records into the shared probe table.
+pub type ProbeSink = Arc<dyn Fn(&CheckRecord) + Send + Sync>;
+
 pub struct Engine {
     pub max_parallel: usize,
     pub flap_threshold: u32,
     pub histories: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<History>>>>>,
+    /// Optional tap: every finished record is handed to this callback so the
+    /// daemon can feed the gossip-shared probe table (M3.3). Pure observers
+    /// (tests) leave it None.
+    pub probe_sink: Option<ProbeSink>,
 }
 
 impl Engine {
@@ -141,7 +185,15 @@ impl Engine {
             max_parallel,
             flap_threshold,
             histories: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            probe_sink: None,
         }
+    }
+
+    /// Attach an observer for finished probe records (called synchronously
+    /// from the probe task; must not block).
+    pub fn with_sink(mut self, sink: Arc<dyn Fn(&CheckRecord) + Send + Sync>) -> Self {
+        self.probe_sink = Some(sink);
+        self
     }
 
     /// Run forever: one tokio task per check spec, a semaphore caps parallelism.
@@ -170,6 +222,9 @@ impl Engine {
                     }
                     let _permit = sem.acquire().await;
                     let rec = http_probe(&spec).await;
+                    if let Some(sink) = &engine.probe_sink {
+                        sink(&rec);
+                    }
                     let is_fail = !matches!(rec.outcome, CheckOutcome::Ok { .. });
                     let mut h = hist.lock().await;
                     h.push(rec);
@@ -195,19 +250,24 @@ pub async fn http_probe(spec: &HttpCheckSpec) -> CheckRecord {
         .build()
         .expect("reqwest client");
     let started = std::time::Instant::now();
-    let outcome = match client.get(&spec.url).send().await {
+    let (outcome, status, ip) = match client.get(&spec.url).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            let ip = resp.remote_addr().map(|a| a.ip().to_string());
             let latency = started.elapsed().as_millis() as u64;
             if status == spec.expect() {
-                CheckOutcome::Ok { latency_ms: latency }
+                (CheckOutcome::Ok { latency_ms: latency }, Some(status), ip)
             } else {
-                CheckOutcome::Fail { reason: format!("status {status}, expected {}", spec.expect()) }
+                (
+                    CheckOutcome::Fail { reason: format!("status {status}, expected {}", spec.expect()) },
+                    Some(status),
+                    ip,
+                )
             }
         }
-        Err(e) => CheckOutcome::Fail { reason: format!("{e}") },
+        Err(e) => (CheckOutcome::Fail { reason: format!("{e}") }, None, None),
     };
-    CheckRecord { check: spec.name.clone(), at: chrono_pseudo::Ts::now(), outcome }
+    CheckRecord { check: spec.name.clone(), at: chrono_pseudo::Ts::now(), outcome, status, ip }
 }
 
 #[cfg(test)]
@@ -268,13 +328,13 @@ mod tests {
     fn history_counts_consecutive_fails() {
         let mut h = History::new(8, None);
         for i in 0..3 {
-            h.push(CheckRecord { check: "c".into(), at: chrono_pseudo::Ts(i), outcome: CheckOutcome::Ok { latency_ms: 1 } });
+            h.push(CheckRecord::bare("c", chrono_pseudo::Ts(i), CheckOutcome::Ok { latency_ms: 1 }));
         }
         assert_eq!(h.consecutive_fails(), 0);
-        h.push(CheckRecord { check: "c".into(), at: chrono_pseudo::Ts(3), outcome: CheckOutcome::Fail { reason: "x".into() } });
-        h.push(CheckRecord { check: "c".into(), at: chrono_pseudo::Ts(4), outcome: CheckOutcome::Fail { reason: "x".into() } });
+        h.push(CheckRecord::bare("c", chrono_pseudo::Ts(3), CheckOutcome::Fail { reason: "x".into() }));
+        h.push(CheckRecord::bare("c", chrono_pseudo::Ts(4), CheckOutcome::Fail { reason: "x".into() }));
         assert_eq!(h.consecutive_fails(), 2);
-        h.push(CheckRecord { check: "c".into(), at: chrono_pseudo::Ts(5), outcome: CheckOutcome::Ok { latency_ms: 1 } });
+        h.push(CheckRecord::bare("c", chrono_pseudo::Ts(5), CheckOutcome::Ok { latency_ms: 1 }));
         assert_eq!(h.consecutive_fails(), 0);
     }
 
