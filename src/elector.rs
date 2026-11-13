@@ -134,7 +134,7 @@ mod tests {
 
     fn nodes(ids: &[u32]) -> Vec<NodeEntry> {
         ids.iter()
-            .map(|&id| NodeEntry { id, name: format!("n{id}"), public_key: None, address: None })
+            .map(|&id| NodeEntry { id, name: format!("n{id}"), public_key: None, address: None, ssh: None })
             .collect()
     }
 

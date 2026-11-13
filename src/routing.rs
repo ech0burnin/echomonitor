@@ -124,7 +124,7 @@ mod tests {
     use super::*;
 
     fn node(id: u32) -> NodeEntry {
-        NodeEntry { id, name: format!("n{id}"), public_key: None, address: None }
+        NodeEntry { id, name: format!("n{id}"), public_key: None, address: None, ssh: None }
     }
 
     fn edge(a: u32, b: u32, ms: u64) -> EdgeEntry {

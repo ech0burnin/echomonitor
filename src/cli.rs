@@ -16,6 +16,11 @@ pub fn init(dir: &str) -> Result<()> {
     let keys = crypto::KeyPair::generate();
     std::fs::write(dir_path.join("node.key"), &keys.secret_hex)?;
     std::fs::write(dir_path.join("node.pub"), &keys.public_hex)?;
+    // M2.6: OpenSSH-format public half of the same key — paste into the
+    // peer user's authorized_keys for the SSH fallback tunnel (and M5.1 deploy).
+    let openssh = crate::tunnel::openssh_public_line(&keys.public_hex)
+        .context("cannot derive openssh public line")?;
+    std::fs::write(dir_path.join("node.pub.openssh"), &openssh)?;
 
     let network_secret = crypto::random_hex(32);
     let cfg = NetworkConfig::bootstrap(network_secret, "node-1".to_string());
@@ -25,6 +30,7 @@ pub fn init(dir: &str) -> Result<()> {
 
     println!("initialized node in {dir}");
     println!("node public key: {}", keys.public_hex);
+    println!("authorized_keys line: {openssh}");
     println!("listen port: {}", cfg.net.listen_port);
     Ok(())
 }
@@ -46,6 +52,26 @@ pub async fn run(dir: &str) -> Result<()> {
         cfg.clone(),
         dir_path.join("network.toml"),
     ));
+
+    // M2.6: SSH fallback transport — one TunnelManager from our node key,
+    // enabled when node.key exists and parses. TOFU pins go next to it.
+    let key_path = dir_path.join("node.key");
+    if key_path.exists() {
+        match std::fs::read_to_string(&key_path)
+            .map_err(|e| anyhow::anyhow!("cannot read node.key: {e}"))
+            .and_then(|seed| {
+                crate::tunnel::TunnelManager::new(
+                    seed.trim(),
+                    dir_path.join("ssh_known_hosts"),
+                )
+            }) {
+            Ok(tm) => {
+                *state.tunnels.lock().await = Some(tm);
+                tracing::info!("ssh tunnel manager ready (fallback transport)");
+            }
+            Err(e) => tracing::warn!(error = %e, "node.key unusable; ssh fallback disabled"),
+        }
+    }
 
     // gossip loop: every interval, push our snapshot to all reachable peers,
     // merge their replies, record RTT latencies
@@ -126,6 +152,10 @@ pub fn keygen() -> Result<()> {
     let kp = crypto::KeyPair::generate();
     println!("secret: {}", kp.secret_hex);
     println!("public: {}", kp.public_hex);
+    match crate::tunnel::openssh_public_line(&kp.public_hex) {
+        Ok(line) => println!("authorized_keys line: {line}"),
+        Err(e) => println!("authorized_keys line: (unavailable: {e})"),
+    }
     Ok(())
 }
 
@@ -154,6 +184,15 @@ pub async fn status(dir: &str) -> Result<()> {
 
     println!("node: {} (id {})", cfg.self_name, cfg.self_id);
     println!("revision {}  hash {}", msg.revision, cfg.content_hash);
+    // M2.6: show the same-key authorized_keys line for convenience
+    let pub_path = dir_path.join("node.pub");
+    if pub_path.exists() {
+        if let Ok(hex) = std::fs::read_to_string(&pub_path) {
+            if let Ok(line) = crate::tunnel::openssh_public_line(hex.trim()) {
+                println!("authorized_keys line: {line}");
+            }
+        }
+    }
     if live {
         println!("source: live daemon at {addr}");
     } else {
@@ -162,7 +201,11 @@ pub async fn status(dir: &str) -> Result<()> {
     println!();
     println!("nodes:");
     for n in &msg.nodes {
-        let naddr = n.address.as_deref().unwrap_or("-");
+        let naddr = n
+            .address
+            .clone()
+            .or_else(|| n.ssh.as_ref().map(|s| format!("ssh {}:{}@{}", s.user, s.host, s.port)))
+            .unwrap_or_else(|| "-".into());
         println!("  {}  {}  {}", n.id, n.name, naddr);
     }
     if msg.edges.is_empty() {

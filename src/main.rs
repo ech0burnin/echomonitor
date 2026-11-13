@@ -10,6 +10,7 @@ mod routing;
 mod selfstats;
 mod sitereport;
 mod transport;
+mod tunnel;
 
 #[derive(Parser)]
 #[command(

@@ -61,7 +61,7 @@ pub struct AuthSection {
     pub network_secret: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeEntry {
     pub id: u32,
@@ -72,6 +72,31 @@ pub struct NodeEntry {
     /// Reachable address (host:port), absent for nodes behind NAT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// M2.6: how to reach this node's system sshd for the fallback tunnel.
+    /// Absent = no tunnel (current behavior, bit-for-bit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshDial>,
+}
+
+/// SSH dial parameters for the M2.6 fallback tunnel (peer's system sshd,
+/// authenticated with our node key). The tunnel always targets the peer's
+/// own loopback HTTP port, so no http port is needed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshDial {
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    #[serde(default = "default_ssh_user")]
+    pub user: String,
+}
+
+fn default_ssh_port() -> u16 {
+    crate::tunnel::DEFAULT_SSH_PORT
+}
+
+fn default_ssh_user() -> String {
+    crate::tunnel::DEFAULT_SSH_USER.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,8 +112,13 @@ pub struct EdgeEntry {
 /// Canonical admin-level hash over (revision, nodes, edges-without-latency).
 /// Order-independent: nodes sorted by id, edges sorted and normalized,
 /// so two configs describing the same network hash identically.
+/// M2.6: the node's `ssh` dial info is admin-level addressing metadata
+/// (same class as `address`) and IS hashed.
+/// Canonical per-node tuple for hashing: (id, name, public_key, address, ssh-dial).
+type NodeCanon<'a> = (u32, &'a str, Option<&'a str>, Option<&'a str>, Option<String>);
+
 pub fn admin_hash(revision: u64, nodes: &[NodeEntry], edges: &[EdgeEntry]) -> String {
-    let mut nodes_canon: Vec<(u32, &str, Option<&str>, Option<&str>)> = nodes
+    let mut nodes_canon: Vec<NodeCanon> = nodes
         .iter()
         .map(|n| {
             (
@@ -96,6 +126,7 @@ pub fn admin_hash(revision: u64, nodes: &[NodeEntry], edges: &[EdgeEntry]) -> St
                 n.name.as_str(),
                 n.public_key.as_deref(),
                 n.address.as_deref(),
+                n.ssh.as_ref().map(|s| format!("{}:{}:{}", s.host, s.port, s.user)),
             )
         })
         .collect();
@@ -129,6 +160,7 @@ impl NetworkConfig {
                 name: self_name.clone(),
                 public_key: None,
                 address: None,
+                ssh: None,
             }],
             edges: Vec::new(),
             checks: Vec::new(),
@@ -217,13 +249,127 @@ bogus_field = 1
     fn hash_is_order_independent() {
         let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
         let mut b = a.clone();
-        a.nodes.push(NodeEntry { id: 2, name: "x".into(), public_key: None, address: None });
-        a.nodes.push(NodeEntry { id: 3, name: "y".into(), public_key: None, address: None });
+        a.nodes.push(NodeEntry { id: 2, name: "x".into(), public_key: None, address: None, ssh: None });
+        a.nodes.push(NodeEntry { id: 3, name: "y".into(), public_key: None, address: None, ssh: None });
         // same nodes, pushed in reverse order
-        b.nodes.push(NodeEntry { id: 3, name: "y".into(), public_key: None, address: None });
-        b.nodes.push(NodeEntry { id: 2, name: "x".into(), public_key: None, address: None });
+        b.nodes.push(NodeEntry { id: 3, name: "y".into(), public_key: None, address: None, ssh: None });
+        b.nodes.push(NodeEntry { id: 2, name: "x".into(), public_key: None, address: None, ssh: None });
         a.recompute_hash();
         b.recompute_hash();
         assert_eq!(a.content_hash, b.content_hash);
+    }
+
+    // ---------- M2.6: ssh dial surface ----------
+
+    #[test]
+    fn ssh_dial_roundtrip_with_defaults() {
+        let mut cfg = NetworkConfig::bootstrap("s".into(), "n1".into());
+        cfg.nodes.push(NodeEntry {
+            id: 2,
+            name: "nat-child".into(),
+            public_key: None,
+            address: None,
+            ssh: Some(SshDial { host: "203.0.113.5".into(), port: 22, user: "root".into() }),
+        });
+        let dir = std::env::temp_dir().join("em-m26-config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network.toml");
+        cfg.save(&path).unwrap();
+        let loaded = NetworkConfig::load(&path).unwrap();
+        assert_eq!(
+            loaded.nodes[1].ssh,
+            Some(SshDial { host: "203.0.113.5".into(), port: 22, user: "root".into() })
+        );
+        // defaults apply when port/user are omitted
+        let raw = r#"
+[[nodes]]
+id = 3
+name = "defaults"
+[nodes.ssh]
+host = "10.0.0.9"
+"#;
+        let parsed: NetworkConfig = toml::from_str(&format!(
+            "revision = 1\ncontent-hash = \"x\"\nself_id = 1\nself_name = \"n\"\n[net]\nlisten_port = 8687\n[auth]\nnetwork_secret = \"s\"\n{}",
+            raw
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.nodes[0].ssh,
+            Some(SshDial { host: "10.0.0.9".into(), port: 22, user: "root".into() })
+        );
+    }
+
+    #[test]
+    fn pre_m26_config_loads_unchanged() {
+        // a config written by an older binary: no ssh anywhere
+        let raw = r#"
+revision = 4
+content-hash = "abc123"
+self_id = 1
+self_name = "legacy"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+[[nodes]]
+id = 1
+name = "legacy"
+[[nodes]]
+id = 2
+name = "peer"
+address = "10.1.1.2:8687"
+[[edges]]
+a = 1
+b = 2
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.nodes.iter().all(|n| n.ssh.is_none()));
+    }
+
+    #[test]
+    fn ssh_unknown_field_rejected() {
+        let raw = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[auth]
+network_secret = "s"
+[[nodes]]
+id = 1
+name = "n"
+[nodes.ssh]
+host = "10.0.0.9"
+bogus = true
+"#;
+        assert!(toml::from_str::<NetworkConfig>(raw).is_err());
+    }
+
+    #[test]
+    fn admin_hash_is_sensitive_to_ssh() {
+        let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
+        let mut b = a.clone();
+        a.nodes.push(NodeEntry {
+            id: 2,
+            name: "x".into(),
+            public_key: None,
+            address: None,
+            ssh: None,
+        });
+        b.nodes.push(NodeEntry {
+            id: 2,
+            name: "x".into(),
+            public_key: None,
+            address: None,
+            ssh: Some(SshDial { host: "10.0.0.9".into(), port: 22, user: "root".into() }),
+        });
+        a.recompute_hash();
+        b.recompute_hash();
+        assert_ne!(a.content_hash, b.content_hash);
+        // and ssh detail differences matter too
+        let mut c = b.clone();
+        c.nodes[1].ssh = Some(SshDial { host: "10.0.0.9".into(), port: 2222, user: "op".into() });
+        c.recompute_hash();
+        assert_ne!(b.content_hash, c.content_hash);
     }
 }

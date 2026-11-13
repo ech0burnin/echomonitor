@@ -185,7 +185,7 @@ mod tests {
     }
 
     fn node(id: u32, name: &str) -> NodeEntry {
-        NodeEntry { id, name: name.into(), public_key: None, address: None }
+        NodeEntry { id, name: name.into(), public_key: None, address: None, ssh: None }
     }
 
     fn ok_probe(check: &str, node: u32, ms_ago: u64, latency: u64, ip: &str, now: u64) -> SiteProbe {

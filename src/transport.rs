@@ -52,6 +52,10 @@ pub struct NodeState {
     pub evidence: Arc<RwLock<crate::elector::Evidence>>,
     /// M2.5: last computed parent (id), for health/status/redirect.
     pub parent: RwLock<Option<u32>>,
+    /// M2.6: SSH fallback tunnel manager (tokio Mutex — building a tunnel
+    /// is async). None when `node.key` is absent/unusable (tests, plain
+    /// status runs): no node gets a tunnel, behavior is M2.5-identical.
+    pub tunnels: tokio::sync::Mutex<Option<crate::tunnel::TunnelManager>>,
 }
 
 impl NodeState {
@@ -63,6 +67,7 @@ impl NodeState {
             probes: Arc::new(RwLock::new(HashMap::new())),
             evidence: Arc::new(RwLock::new(evidence)),
             parent: RwLock::new(None),
+            tunnels: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -74,6 +79,7 @@ impl NodeState {
             probes: Arc::new(RwLock::new(HashMap::new())),
             evidence: Arc::new(RwLock::new(evidence)),
             parent: RwLock::new(None),
+            tunnels: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -228,6 +234,7 @@ fn ensure_self_present(g: &mut NetworkConfig) {
             name: g.self_name.clone(),
             public_key: None,
             address: None,
+            ssh: None,
         });
     }
 }
@@ -272,12 +279,28 @@ fn pick_opt(a: Option<String>, b: Option<String>) -> Option<String> {
     }
 }
 
+/// Field merge for `SshDial` — same commutative rules as the string fields
+/// (lexicographic max per field, max for port), so both sides of an exchange
+/// converge to the identical entry in one round.
+fn merge_ssh(local: &Option<crate::config::SshDial>, remote: &Option<crate::config::SshDial>) -> Option<crate::config::SshDial> {
+    match (local, remote) {
+        (Some(a), Some(b)) => Some(crate::config::SshDial {
+            host: a.host.clone().max(b.host.clone()),
+            user: a.user.clone().max(b.user.clone()),
+            port: a.port.max(b.port),
+        }),
+        (Some(x), None) | (None, Some(x)) => Some(x.clone()),
+        (None, None) => None,
+    }
+}
+
 fn merge_node_entry(local: &NodeEntry, remote: &NodeEntry) -> NodeEntry {
     NodeEntry {
         id: local.id,
         name: local.name.clone().max(remote.name.clone()),
         public_key: pick_opt(local.public_key.clone(), remote.public_key.clone()),
         address: pick_opt(local.address.clone(), remote.address.clone()),
+        ssh: merge_ssh(&local.ssh, &remote.ssh),
     }
 }
 
@@ -348,41 +371,109 @@ pub fn set_edge_latency(cfg: &RwLock<NetworkConfig>, x: u32, y: u32, ms: u64) {
 
 /// One gossip pass: push our snapshot to every reachable peer, merge replies,
 /// measure RTT, persist. Returns (peer_id, Some(latency_ms)) per peer, None on failure.
+///
+/// M2.6 fallback: when direct HTTP fails (or the peer has no `address` at
+/// all — NAT child), retry through an SSH tunnel to the peer's system sshd.
+/// Tunnel-mediated contact counts as liveness evidence and produces an honest
+/// (higher) edge latency, so Dijkstra still prefers a direct path when one
+/// exists. A failed tunnel attempt tears the tunnel down; the next round
+/// retries direct HTTP first and rebuilds only if needed.
 pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, Option<u64>)> {
-    let (self_id, targets) = {
+    let (self_id, listen_port, targets) = {
         let g = state.cfg.read().unwrap();
-        let targets: Vec<(u32, String)> = g
+        // (peer, address, ssh-dial) — address OR ssh makes a node dialable;
+        // specs are copied out so no cfg lock is held across awaits.
+        let targets: Vec<(u32, Option<String>, Option<crate::config::SshDial>)> = g
             .nodes
             .iter()
             .filter(|n| n.id != g.self_id)
-            .filter_map(|n| n.address.as_ref().map(|a| (n.id, a.clone())))
+            .filter(|n| n.address.is_some() || n.ssh.is_some())
+            .map(|n| (n.id, n.address.clone(), n.ssh.clone()))
             .collect();
-        (g.self_id, targets)
+        (g.self_id, g.net.listen_port, targets)
     };
 
     let mut out = Vec::new();
-    for (peer_id, addr) in targets {
-        let msg = state.snapshot_msg();
-        let t0 = Instant::now();
-        match client.gossip(&addr, &msg).await {
-            Ok(reply) => {
-                let ms = t0.elapsed().as_millis() as u64;
+    for (peer_id, address, ssh) in targets {
+        // outcome = Some((reply, rtt_ms)) on success, plus how we got there
+        let mut outcome: Option<(GossipMessage, u64)> = None;
+        let mut via_tunnel = false;
+
+        // 1) direct HTTP when an address is known (always preferred)
+        if let Some(addr) = address.as_deref() {
+            let msg = state.snapshot_msg();
+            let t0 = Instant::now();
+            match client.gossip(addr, &msg).await {
+                Ok(reply) => outcome = Some((reply, t0.elapsed().as_millis() as u64)),
+                Err(e) => tracing::warn!(peer = peer_id, error = %e, "direct gossip failed"),
+            }
+        }
+
+        // 2) SSH fallback: no address at all, or direct just failed
+        if outcome.is_none() {
+            if let Some(ssh) = ssh.as_ref() {
+                match tunnel_endpoint(state, peer_id, ssh, listen_port).await {
+                    Ok(ep) => {
+                        let msg = state.snapshot_msg();
+                        // RTT wraps only the request — the handshake cost
+                        // is paid once per tunnel, not per gossip.
+                        let t0 = Instant::now();
+                        match client.gossip(&ep.to_string(), &msg).await {
+                            Ok(reply) => {
+                                via_tunnel = true;
+                                outcome = Some((reply, t0.elapsed().as_millis() as u64));
+                            }
+                            Err(e) => {
+                                tracing::warn!(peer = peer_id, error = %e, "gossip via ssh tunnel failed");
+                                // tunnel or peer daemon unhealthy — force a
+                                // rebuild next round
+                                let mut guard = state.tunnels.lock().await;
+                                if let Some(tm) = guard.as_mut() {
+                                    tm.note_dead(peer_id);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(peer = peer_id, error = %e, "ssh tunnel unavailable"),
+                }
+            }
+        }
+
+        match outcome {
+            Some((reply, ms)) => {
                 merge_into(&state.cfg, &reply);
                 merge_probes(&state.probes, &reply.probes);
                 merge_seen(&state.evidence, &reply.seen);
                 state.record_seen(peer_id, crate::checks::chrono_pseudo::Ts::now().unix_ms());
                 set_edge_latency(&state.cfg, self_id, peer_id, ms);
-                tracing::debug!(peer = peer_id, latency_ms = ms, "gossip ok");
+                if via_tunnel {
+                    tracing::info!(peer = peer_id, latency_ms = ms, "gossip ok (ssh tunnel)");
+                } else {
+                    tracing::debug!(peer = peer_id, latency_ms = ms, "gossip ok");
+                }
                 out.push((peer_id, Some(ms)));
             }
-            Err(e) => {
-                tracing::warn!(peer = peer_id, error = %e, "gossip failed");
-                out.push((peer_id, None));
-            }
+            None => out.push((peer_id, None)),
         }
     }
     state.persist();
     out
+}
+
+/// Ask the node's TunnelManager for a local endpoint towards the peer,
+/// building/rebuilding the tunnel when needed.
+async fn tunnel_endpoint(
+    state: &NodeState,
+    peer: u32,
+    ssh: &crate::config::SshDial,
+    peer_http_port: u16,
+) -> anyhow::Result<SocketAddr> {
+    let spec = crate::tunnel::TunnelSpec::from_dial(ssh);
+    let mut guard = state.tunnels.lock().await;
+    match guard.as_mut() {
+        Some(tm) => tm.endpoint(peer, &spec, peer_http_port).await,
+        None => Err(anyhow::anyhow!("no tunnel manager (node.key missing?)")),
+    }
 }
 
 // ---------- auth middleware ----------
@@ -595,8 +686,8 @@ mod tests {
             from: 2,
             revision: 5,
             nodes: vec![
-                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None },
-                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()) },
+                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None, ssh: None },
+                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()), ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(7) }],
             probes: vec![], seen: vec![],
@@ -618,7 +709,7 @@ mod tests {
         let msg = GossipMessage {
             from: 2,
             revision: 2,
-            nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None }],
+            nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None, ssh: None }],
             edges: vec![],
             probes: vec![], seen: vec![],
         };
@@ -639,8 +730,8 @@ mod tests {
             from: 2,
             revision: 7,
             nodes: vec![
-                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None },
-                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
+                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None, ssh: None },
+                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
             probes: vec![], seen: vec![],
@@ -658,7 +749,7 @@ mod tests {
     fn same_admin_content_exchanges_latencies() {
         // identical admin content on both sides, only the peer knows the latency
         let mut local = NetworkConfig::bootstrap("s".into(), "n1".into());
-        local.nodes.push(NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None });
+        local.nodes.push(NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None });
         local.edges.push(EdgeEntry { a: 1, b: 2, latency_ms: None });
         local.recompute_hash();
         let shared = RwLock::new(local);
@@ -666,8 +757,8 @@ mod tests {
             from: 2,
             revision: shared.read().unwrap().revision,
             nodes: vec![
-                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None },
-                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None },
+                NodeEntry { id: 1, name: "n1".into(), public_key: None, address: None, ssh: None },
+                NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
             probes: vec![], seen: vec![],
@@ -736,7 +827,7 @@ mod tests {
             &GossipMessage {
                 from: 2,
                 revision: 3,
-                nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None }],
+                nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None }],
                 edges: vec![],
             probes: vec![], seen: vec![],
             },
@@ -836,7 +927,7 @@ mod tests {
                 id: 2,
                 name: "node-2".into(),
                 public_key: None,
-                address: Some(format!("127.0.0.1:{port_b}")),
+                address: Some(format!("127.0.0.1:{port_b}")), ssh: None,
             });
             g.recompute_hash();
         }
@@ -846,7 +937,7 @@ mod tests {
                 id: 1,
                 name: "node-1".into(),
                 public_key: None,
-                address: Some(format!("127.0.0.1:{port_a}")),
+                address: Some(format!("127.0.0.1:{port_a}")), ssh: None,
             });
             g.recompute_hash();
         }
@@ -1005,7 +1096,7 @@ mod tests {
                 id: 2,
                 name: "node-2".into(),
                 public_key: None,
-                address: Some(format!("127.0.0.1:{port_b}")),
+                address: Some(format!("127.0.0.1:{port_b}")), ssh: None,
             });
             g.recompute_hash();
         }
@@ -1024,6 +1115,50 @@ mod tests {
         }
     }
 
+    // ---------- M2.6 ssh dial merge ----------
+
+    #[test]
+    fn merge_node_entry_ssh_is_commutative() {
+        let local = NodeEntry {
+            id: 2,
+            name: "n".into(),
+            public_key: None,
+            address: None,
+            ssh: Some(crate::config::SshDial {
+                host: "10.0.0.5".into(),
+                port: 22,
+                user: "root".into(),
+            }),
+        };
+        let remote = NodeEntry {
+            id: 2,
+            name: "n".into(),
+            public_key: None,
+            address: None,
+            ssh: Some(crate::config::SshDial {
+                host: "10.0.0.9".into(),
+                port: 2222,
+                user: "op".into(),
+            }),
+        };
+        let ab = merge_node_entry(&local, &remote);
+        let ba = merge_node_entry(&remote, &local);
+        assert_eq!(ab, ba, "merge must be commutative");
+        assert_eq!(
+            ab.ssh,
+            Some(crate::config::SshDial { host: "10.0.0.9".into(), port: 2222, user: "root".into() }),
+            "lexicographic max per field, numeric max for port"
+        );
+
+        // one-sided fill
+        let none_ssh = NodeEntry { id: 2, name: "n".into(), public_key: None, address: None, ssh: None };
+        assert_eq!(
+            merge_node_entry(&none_ssh, &remote).ssh,
+            Some(crate::config::SshDial { host: "10.0.0.9".into(), port: 2222, user: "op".into() })
+        );
+        assert_eq!(merge_node_entry(&none_ssh, &none_ssh).ssh, None);
+    }
+
     // ---------- M2.5 parent election ----------
 
     fn wire_pair(state_a: &Arc<NodeState>, state_b: &Arc<NodeState>, port_a: u16, port_b: u16) {
@@ -1032,7 +1167,7 @@ mod tests {
             id: 2,
             name: "node-2".into(),
             public_key: None,
-            address: Some(format!("127.0.0.1:{port_b}")),
+            address: Some(format!("127.0.0.1:{port_b}")), ssh: None,
         });
         g.recompute_hash();
         let mut g = state_b.cfg.write().unwrap();
@@ -1040,7 +1175,7 @@ mod tests {
             id: 1,
             name: "node-1".into(),
             public_key: None,
-            address: Some(format!("127.0.0.1:{port_a}")),
+            address: Some(format!("127.0.0.1:{port_a}")), ssh: None,
         });
         g.recompute_hash();
     }
@@ -1148,7 +1283,7 @@ mod tests {
             id: 1,
             name: "n1".into(),
             public_key: None,
-            address: Some("10.9.9.9:8687".into()),
+            address: Some("10.9.9.9:8687".into()), ssh: None,
         });
         cfg.recompute_hash();
         let state = Arc::new(NodeState::new(cfg));
