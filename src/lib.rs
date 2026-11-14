@@ -6,6 +6,7 @@ pub mod checks;
 pub mod cli;
 pub mod config;
 pub mod crypto;
+pub mod docker;
 pub mod elector;
 pub mod logging;
 pub mod routing;
