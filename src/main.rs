@@ -2,10 +2,10 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "echomonitor",
+    name = "echoeye",
     version,
     about = "Self-hosted distributed mesh monitoring",
-    long_about = "echomonitor — mesh-network monitoring system.\nOne binary acts as either the parent node (web UI + coordinator)\nor a child node. Run `echomonitor init <dir>` on the first host to bootstrap a network."
+    long_about = "Echoeye — mesh-network monitoring system.\nOne binary acts as either the parent node (web UI + coordinator)\nor a child node. Run `echoeye init <dir>` on the first host to bootstrap a network."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -47,13 +47,13 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { dir } => echomonitor::cli::init(&dir),
-        Commands::Run { dir } => echomonitor::cli::run(&dir).await,
-        Commands::Keygen => echomonitor::cli::keygen(),
+        Commands::Init { dir } => echoeye::cli::init(&dir),
+        Commands::Run { dir } => echoeye::cli::run(&dir).await,
+        Commands::Keygen => echoeye::cli::keygen(),
         Commands::Deploy { .. } => {
             println!("deploy: not implemented yet (planned for M5)");
             Ok(())
         }
-        Commands::Status { dir } => echomonitor::cli::status(&dir).await,
+        Commands::Status { dir } => echoeye::cli::status(&dir).await,
     }
 }

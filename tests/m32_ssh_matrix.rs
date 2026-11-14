@@ -16,9 +16,9 @@
 //! deadlines and diagnostics) with a faster cadence: matrix interval 1s
 //! -> stale after 3s (STALE_FACTOR=3).
 
-use echomonitor::config::{EdgeEntry, NetworkConfig, NodeEntry, SshDial};
-use echomonitor::sshmatrix::{build_ssh_report, SshMatrix};
-use echomonitor::transport::{self, NodeClient, NodeState};
+use echoeye::config::{EdgeEntry, NetworkConfig, NodeEntry, SshDial};
+use echoeye::sshmatrix::{build_ssh_report, SshMatrix};
+use echoeye::transport::{self, NodeClient, NodeState};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -136,7 +136,7 @@ async fn spawn_mesh(secret: &str) -> std::io::Result<Vec<Node>> {
         // ssh matrix loop (production path)
         let matrix_state = state.clone();
         rt.spawn(async move {
-            echomonitor::sshmatrix::spawn_ssh_matrix_loop(matrix_state);
+            echoeye::sshmatrix::spawn_ssh_matrix_loop(matrix_state);
         });
         // the node's "system sshd"
         let banner: &'static str = Box::leak(format!("SSH-2.0-fake-{id}\r\n").into_boxed_str());
@@ -260,7 +260,7 @@ async fn three_node_matrix_full_and_survives_node_death() {
     // (age > stale_after = 3s), while surviving pairs stay fresh. Wait
     // until the stale boundary is behind us, then assert both directions
     // of the split in ONE check.
-    let stale_after_ms = INTERVAL_SECS * 1000 * echomonitor::sitereport::STALE_FACTOR;
+    let stale_after_ms = INTERVAL_SECS * 1000 * echoeye::sitereport::STALE_FACTOR;
     poll_until(
         "node-3 rows stale, surviving rows fresh, on node-2",
         || async {
@@ -278,7 +278,7 @@ async fn three_node_matrix_full_and_survives_node_death() {
                 // (with a FAIL outcome now), proving the loop is alive
                 && m.get(&(1, 3)).is_some_and(|p| {
                     p.measured_at.unix_ms() > t_kill
-                        && matches!(p.outcome, echomonitor::checks::CheckOutcome::Fail { .. })
+                        && matches!(p.outcome, echoeye::checks::CheckOutcome::Fail { .. })
                 })
         },
         || diagnostics(&nodes, &obs),
@@ -320,9 +320,9 @@ async fn three_node_matrix_full_and_survives_node_death() {
 fn all_fresh_ok(m: &SshMatrix) -> bool {
     let now = unix_ms_now();
     m.values().all(|p| {
-        matches!(p.outcome, echomonitor::checks::CheckOutcome::Ok { .. })
+        matches!(p.outcome, echoeye::checks::CheckOutcome::Ok { .. })
             && now.saturating_sub(p.measured_at.unix_ms())
-                < INTERVAL_SECS * 1000 * echomonitor::sitereport::STALE_FACTOR
+                < INTERVAL_SECS * 1000 * echoeye::sitereport::STALE_FACTOR
     })
 }
 

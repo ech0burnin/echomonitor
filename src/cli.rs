@@ -37,14 +37,14 @@ pub fn init(dir: &str) -> Result<()> {
 pub async fn run(dir: &str) -> Result<()> {
     let dir_path = Path::new(dir);
     let cfg = NetworkConfig::load(&dir_path.join("network.toml"))
-        .with_context(|| format!("network.toml not found in {dir}; run `echomonitor init` first"))?;
+        .with_context(|| format!("network.toml not found in {dir}; run `echoeye init` first"))?;
 
     let _ = crate::logging::init(&dir_path.join("logs"));
     tracing::info!(
         revision = cfg.revision,
         content_hash = %cfg.content_hash,
         self_name = %cfg.self_name,
-        "starting echomonitor"
+        "starting echoeye"
     );
 
     let state = Arc::new(transport::NodeState::with_persist(

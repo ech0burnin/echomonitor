@@ -686,7 +686,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "echomonitor"
+name = "echoeye"
 version = "0.1.0"
 dependencies = [
  "anyhow",

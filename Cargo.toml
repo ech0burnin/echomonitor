@@ -1,5 +1,5 @@
 [package]
-name = "echomonitor"
+name = "echoeye"
 version = "0.1.0"
 edition = "2021"
 description = "Self-hosted distributed mesh monitoring: one static binary, zero target-host dependencies"

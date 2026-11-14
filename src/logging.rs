@@ -91,8 +91,8 @@ pub fn init(logs_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(logs_dir)?;
 
     INIT.call_once(|| {
-        let human = SharedWriter::leak(logs_dir.join("echomonitor.log"), MAX_LOG_BYTES);
-        let jsonl = SharedWriter::leak(logs_dir.join("echomonitor.jsonl"), MAX_LOG_BYTES);
+        let human = SharedWriter::leak(logs_dir.join("echoeye.log"), MAX_LOG_BYTES);
+        let jsonl = SharedWriter::leak(logs_dir.join("echoeye.jsonl"), MAX_LOG_BYTES);
 
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));

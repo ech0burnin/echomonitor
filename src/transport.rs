@@ -1,5 +1,9 @@
 //! Inter-node HTTP transport with HMAC-token auth and topology gossip.
 //! Every request carries `X-Em-Token` (current 30s-period HMAC) and `X-Em-Node` (self id).
+//! NB: "Em" in these header names is a historical abbreviation of the project's
+//! former name (the crate was renamed to Echoeye on 2026-11-14). The headers are
+//! the live wire protocol shared with nodes running older binaries — do NOT
+//! rename them without protocol versioning.
 //! Middleware rejects anything whose token doesn't verify against the shared network secret.
 //!
 //! M2.2: gossip is a real exchange — the peer replies with its own snapshot,
@@ -651,7 +655,7 @@ async fn gossip(
     Json(state.snapshot_msg())
 }
 
-/// Current topology view (auth'd; used by `echomonitor status`).
+/// Current topology view (auth'd; used by `echoeye status`).
 async fn state_handler(State(state): State<Arc<NodeState>>) -> Json<GossipMessage> {
     Json(state.snapshot_msg())
 }

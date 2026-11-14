@@ -115,7 +115,7 @@ pub fn private_key_from_seed_hex(seed_hex: &str) -> Result<PrivateKey> {
         .try_into()
         .map_err(|_| anyhow!("node.key must hold a 32-byte ed25519 seed (64 hex chars)"))?;
     let kp = Ed25519Keypair::from_seed(arr);
-    PrivateKey::new(KeypairData::Ed25519(kp), "echomonitor").context("cannot build ssh key")
+    PrivateKey::new(KeypairData::Ed25519(kp), "echoeye").context("cannot build ssh key")
 }
 
 /// The OpenSSH authorized_keys line for our node identity (`node.pub`,
@@ -130,7 +130,7 @@ pub fn openssh_public_line(public_hex: &str) -> Result<String> {
         .try_into()
         .map_err(|_| anyhow!("node.pub must hold a 32-byte ed25519 public key (64 hex chars)"))?;
     let pk = OpensshPublic::from(KeyData::Ed25519(Ed25519PublicKey(bytes)));
-    Ok(format!("{} echomonitor", pk.to_openssh()?))
+    Ok(format!("{} echoeye", pk.to_openssh()?))
 }
 
 impl TunnelManager {
@@ -302,7 +302,7 @@ fn verify_or_pin(pins_path: &Path, host: &str, fingerprint: &str) -> bool {
                             host,
                             pinned,
                             presented = fingerprint,
-                            "SSH HOST KEY MISMATCH for echomonitor peer — possible MITM, refusing"
+                            "SSH HOST KEY MISMATCH for echoeye peer — possible MITM, refusing"
                         );
                         false
                     }
@@ -597,7 +597,7 @@ mod tests {
         panic!("disposable sshd never became reachable");
     }
 
-    /// Spawn the "NAT peer": plain echomonitor router on an ephemeral port.
+    /// Spawn the "NAT peer": plain echoeye router on an ephemeral port.
     /// Returns (state, http_port).
     async fn spawn_nat_peer(secret: &str) -> (Arc<crate::transport::NodeState>, u16) {
         let mut cfg = NetworkConfig::bootstrap(secret.into(), "node-2".into());

@@ -1,4 +1,4 @@
-# echomonitor
+# Echoeye
 
 **Self-hosted distributed mesh monitoring. One static binary. Zero dependencies on the target host.**
 
@@ -6,7 +6,7 @@
 
 ## What is this?
 
-echomonitor is a lightweight, self-hosted monitoring system for small fleets of servers:
+Echoeye is a lightweight, self-hosted monitoring system for small fleets of servers:
 
 - **Mesh network of nodes** — gossip topology discovery, latency-based routing, automatic parent (leader) election. No single point of failure: the network config is replicated to every node.
 - **One static binary** (musl, x86_64 + aarch64) — the web UI is embedded, nothing to install on target servers.

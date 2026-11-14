@@ -23,8 +23,8 @@
 //! fails the test with a full diagnostic dump (per-node health, view,
 //! evidence ages).
 
-use echomonitor::config::{EdgeEntry, NetworkConfig, NodeEntry};
-use echomonitor::transport::{self, GossipMessage, NodeClient, NodeState};
+use echoeye::config::{EdgeEntry, NetworkConfig, NodeEntry};
+use echoeye::transport::{self, GossipMessage, NodeClient, NodeState};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -235,7 +235,7 @@ async fn three_nodes_survive_parent_death_and_re_elect() {
     poll_until(
         "converged views: same nodes everywhere, all ids evidenced",
         || async {
-            let t_dead = echomonitor::elector::t_dead_for(INTERVAL_SECS);
+            let t_dead = echoeye::elector::t_dead_for(INTERVAL_SECS);
             let mut good = 0;
             for n in &nodes {
                 if let Ok(v) = obs.state(&n.addr).await {
