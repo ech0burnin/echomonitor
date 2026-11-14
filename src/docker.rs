@@ -240,6 +240,8 @@ pub fn spawn_docker_loop(state: Arc<NodeState>) -> Option<tokio::task::JoinHandl
 
 /// Injectable-socket variant for integration tests (a fake dockerd in a
 /// tempdir, M3.5-c); production always goes through `spawn_docker_loop`.
+/// `pub` because tests/ is a separate crate — `pub(crate)` would not
+/// reach it; this is a pure test seam, no other callers expected.
 ///
 /// Every tick: fetch + parse the local container list, record OUR OWN
 /// snapshot into the shared table (it rides along with gossip), then
@@ -248,7 +250,7 @@ pub fn spawn_docker_loop(state: Arc<NodeState>) -> Option<tokio::task::JoinHandl
 /// node"), later misses debug, and no row is ever written. Any other
 /// error (socket present but daemon broken/permission denied) is a warn
 /// plus an honest error row. 0 interval disables the loop (None + info).
-fn spawn_docker_loop_with_sock(state: Arc<NodeState>, sock_path: &str) -> Option<tokio::task::JoinHandle<()>> {
+pub fn spawn_docker_loop_with_sock(state: Arc<NodeState>, sock_path: &str) -> Option<tokio::task::JoinHandle<()>> {
     let (interval_secs, self_id) = {
         let g = state.cfg.read().unwrap();
         (g.net.docker_check_interval_secs, g.self_id)
