@@ -21,9 +21,11 @@
 
 use crate::checks::chrono_pseudo::Ts;
 use crate::config::NodeEntry;
+use crate::transport::NodeState;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -36,6 +38,9 @@ pub const READ_BUDGET: Duration = Duration::from_secs(3);
 /// Docker API endpoint polled every tick: `all=1` includes stopped
 /// containers — an exited container is a signal, not noise.
 pub const LIST_PATH: &str = "/containers/json?all=1";
+/// The docker daemon's unix socket (constant by the same policy as
+/// selfstats::DISK_PATH: not worth a config knob, standard path everywhere).
+pub const DOCKER_SOCK: &str = "/var/run/docker.sock";
 /// Response body cap: a real host has a bounded number of containers;
 /// this only guards against a pathological peer streaming forever.
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
@@ -222,6 +227,93 @@ pub fn merge_docker_probes(table: &std::sync::RwLock<DockerTable>, incoming: &[D
 /// node's snapshot must not render forever).
 pub fn retain_known(table: &std::sync::RwLock<DockerTable>, known_ids: &HashSet<u32>) {
     table.write().unwrap().retain(|&id, _| known_ids.contains(&id));
+}
+
+// ---------- daemon loop ----------
+
+/// The daemon's docker monitoring loop (production entry): polls the
+/// standard socket every `net.docker_check_interval_secs`. See
+/// `spawn_docker_loop_with_sock` for the tick shape.
+pub fn spawn_docker_loop(state: Arc<NodeState>) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_docker_loop_with_sock(state, DOCKER_SOCK)
+}
+
+/// Injectable-socket variant for integration tests (a fake dockerd in a
+/// tempdir, M3.5-c); production always goes through `spawn_docker_loop`.
+///
+/// Every tick: fetch + parse the local container list, record OUR OWN
+/// snapshot into the shared table (it rides along with gossip), then
+/// sweep rows of de-configured nodes. A host without the socket is NOT
+/// unhealthy: the first miss logs one info line ("feature off on this
+/// node"), later misses debug, and no row is ever written. Any other
+/// error (socket present but daemon broken/permission denied) is a warn
+/// plus an honest error row. 0 interval disables the loop (None + info).
+fn spawn_docker_loop_with_sock(state: Arc<NodeState>, sock_path: &str) -> Option<tokio::task::JoinHandle<()>> {
+    let (interval_secs, self_id) = {
+        let g = state.cfg.read().unwrap();
+        (g.net.docker_check_interval_secs, g.self_id)
+    };
+    if interval_secs == 0 {
+        tracing::info!("docker monitoring disabled (net.docker_check_interval_secs = 0)");
+        return None;
+    }
+    let sock = sock_path.to_string();
+    Some(tokio::spawn(async move {
+        tracing::info!(interval_secs, "docker loop starting");
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut missing_socket_announced = false;
+        loop {
+            tick.tick().await;
+            let sock_present = std::path::Path::new(&sock).exists();
+            if !sock_present {
+                // feature not present on this host: stay quiet, no row
+                if !missing_socket_announced {
+                    tracing::info!("docker socket {sock} not found; container monitoring off on this node");
+                    missing_socket_announced = true;
+                } else {
+                    tracing::debug!("docker socket {sock} still not found");
+                }
+            } else {
+                let probe = match fetch(&sock).await {
+                    Ok(body) => match parse_docker_list(&body) {
+                        Ok(containers) => DockerProbe {
+                            node_id: self_id,
+                            measured_at: Ts::now(),
+                            containers,
+                            error: None,
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "docker list parse failed");
+                            DockerProbe {
+                                node_id: self_id,
+                                measured_at: Ts::now(),
+                                containers: Vec::new(),
+                                error: Some(e.to_string()),
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "docker poll failed");
+                        DockerProbe {
+                            node_id: self_id,
+                            measured_at: Ts::now(),
+                            containers: Vec::new(),
+                            error: Some(e.to_string()),
+                        }
+                    }
+                };
+                tracing::debug!(node = self_id, containers = probe.containers.len(), "docker poll done");
+                state.record_own_docker_probe(probe);
+            }
+            // sweep rows of de-configured nodes (same as the ssh matrix)
+            let known_ids: HashSet<u32> = {
+                let g = state.cfg.read().unwrap();
+                g.nodes.iter().map(|n| n.id).collect()
+            };
+            retain_known(&state.docker, &known_ids);
+        }
+    }))
 }
 
 // ---------- report ----------
@@ -622,5 +714,20 @@ mod tests {
         let err = fetch(sock.to_str().unwrap()).await.unwrap_err();
         assert!(err.to_string().contains("500"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- daemon loop ----------
+
+    #[test]
+    fn docker_loop_disabled_returns_none() {
+        // 0 interval: the loop must not spawn at all (and this test must
+        // never touch the real /var/run/docker.sock — the None branch
+        // returns before any task exists).
+        let mut cfg = crate::config::NetworkConfig::bootstrap("s".into(), "n1".into());
+        cfg.net.docker_check_interval_secs = 0;
+        let state = Arc::new(NodeState::new(cfg));
+        assert!(spawn_docker_loop(state).is_none());
+        // the default cadence is on, so a plain bootstrap would have spawned
+        assert_eq!(crate::config::DEFAULT_DOCKER_CHECK_INTERVAL_SECS, 60);
     }
 }

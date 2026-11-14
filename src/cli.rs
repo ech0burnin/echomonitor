@@ -116,6 +116,12 @@ pub async fn run(dir: &str) -> Result<()> {
     // only — no persistence, no hash impact.
     crate::sshmatrix::spawn_ssh_matrix_loop(state.clone());
 
+    // M3.5: local docker container monitoring over /var/run/docker.sock.
+    // Every node polls its OWN daemon and shares the snapshot via gossip;
+    // 0 disables the loop. A host without the socket stays quiet.
+    // Runtime data only — no persistence, no hash impact.
+    crate::docker::spawn_docker_loop(state.clone());
+
     // M3.6: periodic systemd unit liveness (`units = [...]` config).
     // Results land in the shared state and ride along with /api/state;
     // runtime data only — no gossip merge, no persistence, no hash impact.
@@ -174,6 +180,7 @@ pub async fn status(dir: &str) -> Result<()> {
                 ssh: Vec::new(),
                 seen: Vec::new(),
                 units: Vec::new(),
+                docker: Vec::new(),
             },
             false,
         ),
@@ -316,6 +323,31 @@ pub async fn status(dir: &str) -> Result<()> {
     } else {
         for l in lines {
             println!("{l}");
+        }
+    }
+    println!();
+    // M3.5: docker containers per node. Live daemon -> straight from the
+    // gossip-shared table; disabled interval -> explicit marker; a table
+    // with no rows yet -> honest "(no data)".
+    println!("docker:");
+    if cfg.net.docker_check_interval_secs == 0 {
+        println!("  (disabled)");
+    } else {
+        let mut table: crate::docker::DockerTable = crate::docker::DockerTable::new();
+        for p in &msg.docker {
+            table.insert(p.node_id, p.clone());
+        }
+        let lines = crate::docker::build_docker_report(
+            &msg.nodes,
+            &table,
+            crate::checks::chrono_pseudo::Ts::now().unix_ms(),
+        );
+        if lines.is_empty() {
+            println!("  (no data)");
+        } else {
+            for l in lines {
+                println!("{l}");
+            }
         }
     }
     Ok(())

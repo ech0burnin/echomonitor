@@ -15,6 +15,8 @@ pub const DEFAULT_LISTEN_PORT: u16 = 8687;
 pub const DEFAULT_GOSSIP_INTERVAL_SECS: u64 = 15;
 /// M3.2: default cadence of the directed SSH matrix probes (seconds).
 pub const DEFAULT_SSH_CHECK_INTERVAL_SECS: u64 = 60;
+/// M3.5: default cadence of the local docker container poll (seconds).
+pub const DEFAULT_DOCKER_CHECK_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +64,12 @@ pub struct NetSection {
     /// listen_port), not replicated admin content.
     #[serde(default = "default_ssh_check_interval")]
     pub ssh_check_interval_secs: u64,
+    /// M3.5: cadence of the local docker container poll over
+    /// /var/run/docker.sock, seconds. 0 disables the loop entirely.
+    /// Same rule as the ssh interval: local-node runtime tuning,
+    /// NEVER part of the admin hash.
+    #[serde(default = "default_docker_check_interval")]
+    pub docker_check_interval_secs: u64,
 }
 
 fn default_listen_port() -> u16 {
@@ -74,6 +82,10 @@ fn default_gossip_interval() -> u64 {
 
 fn default_ssh_check_interval() -> u64 {
     DEFAULT_SSH_CHECK_INTERVAL_SECS
+}
+
+fn default_docker_check_interval() -> u64 {
+    DEFAULT_DOCKER_CHECK_INTERVAL_SECS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +224,7 @@ impl NetworkConfig {
                 listen_port: DEFAULT_LISTEN_PORT,
                 gossip_interval_secs: DEFAULT_GOSSIP_INTERVAL_SECS,
                 ssh_check_interval_secs: DEFAULT_SSH_CHECK_INTERVAL_SECS,
+                docker_check_interval_secs: DEFAULT_DOCKER_CHECK_INTERVAL_SECS,
             },
             auth: AuthSection { network_secret },
             nodes: vec![NodeEntry {
@@ -747,22 +760,72 @@ network_secret = "s"
         assert_eq!(NetworkConfig::load(&p).unwrap().net.ssh_check_interval_secs, 0);
     }
 
+    // ---------- M3.5: docker poll interval ----------
+
+    #[test]
+    fn docker_interval_default_and_roundtrip() {
+        // A legacy config (no docker_check_interval_secs key) parses with
+        // the default cadence: the feature is on without any config edit.
+        let raw = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+[auth]
+network_secret = "s"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.net.docker_check_interval_secs, DEFAULT_DOCKER_CHECK_INTERVAL_SECS);
+        assert_eq!(cfg.net.docker_check_interval_secs, 60);
+
+        // An explicit value parses and survives a full save/load roundtrip
+        // (including 0 = feature off).
+        let raw_on = r#"
+revision = 1
+content-hash = "x"
+self_id = 1
+self_name = "n"
+[net]
+listen_port = 8687
+docker_check_interval_secs = 5
+[auth]
+network_secret = "s"
+"#;
+        let cfg: NetworkConfig = toml::from_str(raw_on).unwrap();
+        assert_eq!(cfg.net.docker_check_interval_secs, 5);
+        let dir = std::env::temp_dir().join("em-m35-config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("network.toml");
+        cfg.save(&p).unwrap();
+        let loaded = NetworkConfig::load(&p).unwrap();
+        assert_eq!(loaded.net.docker_check_interval_secs, 5);
+
+        let mut off = cfg.clone();
+        off.net.docker_check_interval_secs = 0;
+        off.save(&p).unwrap();
+        assert_eq!(NetworkConfig::load(&p).unwrap().net.docker_check_interval_secs, 0);
+    }
+
     #[test]
     fn net_fields_do_not_affect_admin_hash() {
         // The whole net section is local tuning, never admin content:
-        // differing listen ports / gossip and ssh-matrix intervals must
-        // all hash identically (mesh nodes tune cadence independently).
+        // differing listen ports / gossip, ssh-matrix and docker intervals
+        // must all hash identically (mesh nodes tune cadence independently).
         let mut a = NetworkConfig::bootstrap("s".into(), "n".into());
         let mut b = a.clone();
         let mut c = a.clone();
         b.net.listen_port = 9999;
         b.net.gossip_interval_secs = 30;
         b.net.ssh_check_interval_secs = 5;
+        b.net.docker_check_interval_secs = 7;
         c.net.ssh_check_interval_secs = 0;
+        c.net.docker_check_interval_secs = 0;
         a.recompute_hash();
         b.recompute_hash();
         c.recompute_hash();
         assert_eq!(a.content_hash, b.content_hash, "net fields must not affect the admin hash");
-        assert_eq!(a.content_hash, c.content_hash, "matrix off must not affect the admin hash");
+        assert_eq!(a.content_hash, c.content_hash, "monitors off must not affect the admin hash");
     }
 }

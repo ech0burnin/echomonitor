@@ -64,6 +64,10 @@ pub struct NodeState {
     /// Runtime-only state: never persisted, never part of admin_hash;
     /// merged LWW on `measured_at` (see sshmatrix::merge_ssh_probes).
     pub ssh_matrix: Arc<RwLock<crate::sshmatrix::SshMatrix>>,
+    /// M3.5: local docker container snapshots, latest per node id.
+    /// Runtime-only state: never persisted, never part of admin_hash;
+    /// merged LWW on `measured_at` (see docker::merge_docker_probes).
+    pub docker: Arc<RwLock<crate::docker::DockerTable>>,
     /// M2.6: SSH fallback tunnel manager (tokio Mutex — building a tunnel
     /// is async). None when `node.key` is absent/unusable (tests, plain
     /// status runs): no node gets a tunnel, behavior is M2.5-identical.
@@ -81,6 +85,7 @@ impl NodeState {
             parent: RwLock::new(None),
             units: Arc::new(RwLock::new(Vec::new())),
             ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
+            docker: Arc::new(RwLock::new(HashMap::new())),
             tunnels: tokio::sync::Mutex::new(None),
         }
     }
@@ -95,6 +100,7 @@ impl NodeState {
             parent: RwLock::new(None),
             units: Arc::new(RwLock::new(Vec::new())),
             ssh_matrix: Arc::new(RwLock::new(HashMap::new())),
+            docker: Arc::new(RwLock::new(HashMap::new())),
             tunnels: tokio::sync::Mutex::new(None),
         }
     }
@@ -128,6 +134,13 @@ impl NodeState {
         t.insert((probe.from, probe.to), probe);
     }
 
+    /// M3.5: record OUR OWN local docker snapshot (writer: the daemon's
+    /// docker loop; the table then rides along with gossip).
+    pub fn record_own_docker_probe(&self, probe: crate::docker::DockerProbe) {
+        let mut t = self.docker.write().unwrap();
+        t.insert(probe.node_id, probe);
+    }
+
     /// Atomically persist the current config view (tmp file + rename).
     /// Best-effort: persistence failure is logged, never fatal.
     pub fn persist(&self) {
@@ -154,6 +167,8 @@ impl NodeState {
         let probes: Vec<SiteProbe> = self.probes.read().unwrap().values().cloned().collect();
         let ssh: Vec<crate::sshmatrix::SshProbe> =
             self.ssh_matrix.read().unwrap().values().cloned().collect();
+        let docker: Vec<crate::docker::DockerProbe> =
+            self.docker.read().unwrap().values().cloned().collect();
         let seen: Vec<SeenEntry> = self
             .evidence
             .read()
@@ -170,6 +185,7 @@ impl NodeState {
             ssh,
             seen,
             units: self.units.read().unwrap().clone(),
+            docker,
         }
     }
 }
@@ -199,6 +215,10 @@ pub struct GossipMessage {
     /// old-wire safety as probes/seen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<crate::selfstats::UnitStatus>,
+    /// M3.5: per-node local docker container snapshots shared through
+    /// gossip, latest per node id. Same old-wire safety as probes/ssh.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docker: Vec<crate::docker::DockerProbe>,
 }
 
 /// One liveness observation: node `id` was directly reachable at `at_ms`
@@ -500,6 +520,7 @@ pub async fn gossip_round(state: &NodeState, client: &NodeClient) -> Vec<(u32, O
                 merge_into(&state.cfg, &reply);
                 merge_probes(&state.probes, &reply.probes);
                 crate::sshmatrix::merge_ssh_probes(&state.ssh_matrix, &reply.ssh);
+                crate::docker::merge_docker_probes(&state.docker, &reply.docker);
                 merge_seen(&state.evidence, &reply.seen);
                 state.record_seen(peer_id, crate::checks::chrono_pseudo::Ts::now().unix_ms());
                 set_edge_latency(&state.cfg, self_id, peer_id, ms);
@@ -649,6 +670,7 @@ async fn gossip(
     merge_into(&state.cfg, &msg);
     merge_probes(&state.probes, &msg.probes);
     crate::sshmatrix::merge_ssh_probes(&state.ssh_matrix, &msg.ssh);
+    crate::docker::merge_docker_probes(&state.docker, &msg.docker);
     merge_seen(&state.evidence, &msg.seen);
     state.record_seen(msg.from, crate::checks::chrono_pseudo::Ts::now().unix_ms());
     state.persist();
@@ -845,7 +867,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: Some("10.0.0.2:8687".into()), ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(7) }],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -866,7 +888,7 @@ mod tests {
             revision: 2,
             nodes: vec![NodeEntry { id: 9, name: "x".into(), public_key: None, address: None, ssh: None }],
             edges: vec![],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -889,7 +911,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 1, b: 2, latency_ms: None }],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -916,7 +938,7 @@ mod tests {
                 NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None },
             ],
             edges: vec![EdgeEntry { a: 2, b: 1, latency_ms: Some(12) }],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
         };
         merge_into(&shared, &msg);
         let g = shared.read().unwrap();
@@ -946,11 +968,11 @@ mod tests {
         let msg_a_to_b = shared_a.read().unwrap().clone();
         merge_into(
             &shared_a,
-            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![] },
+            &GossipMessage { from: 2, revision: msg_b_to_a.revision, nodes: msg_b_to_a.nodes.clone(), edges: msg_b_to_a.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![] },
         );
         merge_into(
             &shared_b,
-            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![] },
+            &GossipMessage { from: 1, revision: msg_a_to_b.revision, nodes: msg_a_to_b.nodes.clone(), edges: msg_a_to_b.edges.clone(), probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![] },
         );
 
         let ga = shared_a.read().unwrap();
@@ -984,7 +1006,7 @@ mod tests {
                 revision: 3,
                 nodes: vec![NodeEntry { id: 2, name: "n2".into(), public_key: None, address: None, ssh: None }],
                 edges: vec![],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
             },
         );
         state.persist();
@@ -1025,7 +1047,7 @@ mod tests {
             revision: 1,
             nodes: vec![],
             edges: vec![],
-            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![], docker: vec![],
         };
         let reply = nc.gossip(&format!("127.0.0.1:{port}"), &msg).await.unwrap();
         assert_eq!(reply.from, 1);
@@ -1370,6 +1392,121 @@ mod tests {
             assert_eq!(m.len(), 2, "{label} must hold both directed rows after one round");
             assert!(m.contains_key(&(1, 2)), "{label} missing row 1->2");
             assert!(m.contains_key(&(2, 1)), "{label} missing row 2->1");
+        }
+    }
+
+    // ---------- M3.5: docker snapshots through gossip ----------
+
+    fn docker_probe_of(node_id: u32, at_ms: u64, names: &[&str]) -> crate::docker::DockerProbe {
+        crate::docker::DockerProbe {
+            node_id,
+            measured_at: Ts(at_ms),
+            containers: names
+                .iter()
+                .map(|n| crate::docker::DockerContainer {
+                    name: (*n).into(),
+                    state: "running".into(),
+                    status: "Up 1 minute".into(),
+                    health: None,
+                })
+                .collect(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_msg_carries_docker() {
+        let state = test_state();
+        state.record_own_docker_probe(docker_probe_of(1, 1_000, &["searxng", "npm"]));
+        let msg = state.snapshot_msg();
+        assert_eq!(msg.docker.len(), 1);
+        assert_eq!(msg.docker[0].node_id, 1);
+        assert_eq!(msg.docker[0].containers.len(), 2);
+        // and it serializes into the /api/state wire format
+        let j = serde_json::to_value(&msg).unwrap();
+        assert_eq!(j["docker"][0]["containers"][0]["name"], "searxng");
+    }
+
+    #[test]
+    fn gossip_message_without_docker_field_parses() {
+        // Pre-M3.5 wire format (no docker key) must stay deserializable.
+        let raw = r#"{
+            "from": 2, "revision": 1,
+            "nodes": [], "edges": [], "probes": [], "seen": []
+        }"#;
+        let msg: GossipMessage = serde_json::from_str(raw).expect("legacy message parses");
+        assert!(msg.docker.is_empty());
+        // and the docker key never appears in an empty snapshot (skip rule)
+        let empty = serde_json::to_value(test_state().snapshot_msg()).unwrap();
+        assert!(empty.get("docker").is_none());
+    }
+
+    #[tokio::test]
+    async fn gossip_handler_merges_docker_rows() {
+        // the inbound merge site (transport::gossip handler) must update
+        // the shared table and echo it back in the reply snapshot
+        let state = test_state();
+        let msg = GossipMessage {
+            from: 2,
+            revision: 1,
+            nodes: vec![],
+            edges: vec![],
+            probes: vec![], ssh: vec![], seen: vec![], units: vec![],
+            docker: vec![docker_probe_of(2, 1_000, &["searxng"])],
+        };
+        let reply = gossip(State(state.clone()), Json(msg)).await;
+        let t = state.docker.read().unwrap();
+        assert_eq!(t.len(), 1, "handler must merge the peer's docker row");
+        assert_eq!(t.get(&2).unwrap().containers[0].name, "searxng");
+        drop(t);
+        // push-pull: our reply carries the freshly merged row back
+        assert_eq!(reply.0.docker.len(), 1);
+        assert_eq!(reply.0.docker[0].node_id, 2);
+    }
+
+    #[tokio::test]
+    async fn docker_snapshots_converge_in_one_exchange_round() {
+        // the client merge site (gossip_round) must merge the peer's
+        // docker rows from its reply — same shape as the ssh matrix test
+        let mut cfg_a = NetworkConfig::bootstrap("test-secret".into(), "node-1".into());
+        let mut cfg_b = NetworkConfig::bootstrap("test-secret".into(), "node-2".into());
+        cfg_b.self_id = 2;
+        cfg_b.nodes[0].id = 2;
+        cfg_a.recompute_hash();
+        cfg_b.recompute_hash();
+
+        let state_a = Arc::new(NodeState::new(cfg_a));
+        let state_b = Arc::new(NodeState::new(cfg_b));
+
+        state_a.record_own_docker_probe(docker_probe_of(1, 1_000, &["npm"]));
+        state_b.record_own_docker_probe(docker_probe_of(2, 1_000, &["searxng", "tuwunel"]));
+
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_b = lb.local_addr().unwrap().port();
+        let sb = state_b.clone();
+        tokio::spawn(async move { axum::serve(lb, router(sb)).await.unwrap() });
+
+        {
+            let mut g = state_a.cfg.write().unwrap();
+            g.nodes.push(NodeEntry {
+                id: 2,
+                name: "node-2".into(),
+                public_key: None,
+                address: Some(format!("127.0.0.1:{port_b}")), ssh: None,
+            });
+            g.recompute_hash();
+        }
+
+        // ONE round: A pushes (B merges A's row), B replies (A merges B's)
+        let client_a = NodeClient::new("test-secret".into(), 1);
+        let res = gossip_round(&state_a, &client_a).await;
+        assert!(res[0].1.is_some(), "gossip must succeed");
+
+        for (state, label) in [(&state_a, "A"), (&state_b, "B")] {
+            let t = state.docker.read().unwrap();
+            assert_eq!(t.len(), 2, "{label} must hold both nodes' rows after one round");
+            assert!(t.contains_key(&1), "{label} missing node-1 row");
+            assert!(t.contains_key(&2), "{label} missing node-2 row");
         }
     }
 
